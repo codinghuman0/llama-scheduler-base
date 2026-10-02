@@ -18,9 +18,10 @@ The normal llama.cpp build must not require:
 - kernel BTF
 - root privileges
 
-This Step 3 commit contains only repository structure and provenance. It does
-not yet contain the project scheduler implementation. The current validated
-implementation remains recoverable from:
+The Step 3 skeleton commit contained only repository structure and provenance.
+The `validation/` directory now contains the imported golden instrumented
+implementation. The future lightweight implementation has not been created
+yet. The current validated implementation remains recoverable from:
 
 - repository: https://github.com/codinghuman0/llama-scheduler
 - local golden tag: `validation-scheduler-baseline-v1`
