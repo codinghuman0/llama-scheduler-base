@@ -3377,7 +3377,6 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
     int n_threads                               = cplan->n_threads;
-    const int n_threads_planned                 = n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
 
     bool disposable_threadpool = false;
@@ -3434,9 +3433,6 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     // This is a work thread too
     ggml_graph_compute_thread(&threadpool->workers[0]);
 #endif
-
-    GGML_LOG_DEBUG("%s: planned_threads=%d, actual_team_size=%d, pool_threads=%d, disposable_threadpool=%s\n",
-            __func__, n_threads_planned, n_threads, threadpool->n_threads, disposable_threadpool ? "yes" : "no");
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
