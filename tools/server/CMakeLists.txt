@@ -33,6 +33,10 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
+if (LLAMA_SCX_PHASE_HINT OR LLAMA_SCX_PHASE_TRACE)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_SCX_PHASE_HINT)
+endif()
+
 # llama-server-impl: server logic, reusable by app
 
 set(TARGET llama-server-impl)

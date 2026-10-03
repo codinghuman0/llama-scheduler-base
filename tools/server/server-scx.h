@@ -1,8 +1,20 @@
 #pragma once
 
+#ifdef LLAMA_SCX_PHASE_HINT
+#include "server-phase.h"
+
+extern "C" {
+void llama_scx_phase_v1(uint32_t phase);
+
+__attribute__((noinline, used, visibility("default")))
+void llama_scx_phase_v1(uint32_t phase) {
+    __asm__ __volatile__("nop" : : "r"(phase) : "memory");
+}
+}
+#endif
+
 #ifdef LLAMA_SCX_PHASE_TRACE
 #include "llama.h"
-#include "server-phase.h"
 #include <cstdint>
 
 // Keep the v1 layout in sync with llama-scheduler/include/llama_phase.h.
@@ -23,7 +35,6 @@ static_assert(sizeof(server_scx_event) == 80, "SCX phase ABI v1");
 extern "C" {
 void llama_scx_decode_begin_v1(const server_scx_event * event);
 void llama_scx_decode_end_v1(const server_scx_event * event);
-void llama_scx_phase_v1(uint32_t phase);
 
 __attribute__((noinline, used, visibility("default")))
 void llama_scx_decode_begin_v1(const server_scx_event * event) {
@@ -35,10 +46,6 @@ void llama_scx_decode_end_v1(const server_scx_event * event) {
     __asm__ __volatile__("nop; nop" : : "r"(event) : "memory");
 }
 
-__attribute__((noinline, used, visibility("default")))
-void llama_scx_phase_v1(uint32_t phase) {
-    __asm__ __volatile__("nop" : : "r"(phase) : "memory");
-}
 }
 
 class server_scx_scope {

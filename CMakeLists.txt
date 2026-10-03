@@ -32,7 +32,12 @@ else()
 endif()
 
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
+option(LLAMA_SCX_PHASE_HINT "llama: lightweight Linux sched_ext semantic phase marker" OFF)
 option(LLAMA_SCX_PHASE_TRACE "llama: experimental Linux sched_ext phase markers" OFF)
+
+if (LLAMA_SCX_PHASE_HINT AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "LLAMA_SCX_PHASE_HINT requires Linux")
+endif()
 
 if (LLAMA_SCX_PHASE_TRACE)
     if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR LLAMA_USE_SYSTEM_GGML)

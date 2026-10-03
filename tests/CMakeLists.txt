@@ -221,7 +221,7 @@ endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-compute-profile.cpp)
-if (LLAMA_SCX_PHASE_TRACE)
+if (LLAMA_SCX_PHASE_HINT OR LLAMA_SCX_PHASE_TRACE)
     add_executable(test-server-scx test-server-scx.cpp)
     target_include_directories(test-server-scx PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_compile_features(test-server-scx PRIVATE cxx_std_17)
