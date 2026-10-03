@@ -31,16 +31,6 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
-static const char * compute_profile_to_string(llama_compute_profile compute_profile) {
-    switch (compute_profile) {
-        case LLAMA_COMPUTE_PROFILE_AUTO:       return "auto";
-        case LLAMA_COMPUTE_PROFILE_GENERATION: return "generation";
-        case LLAMA_COMPUTE_PROFILE_BATCH:      return "batch";
-    }
-
-    return "invalid";
-}
-
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -2473,9 +2463,6 @@ ggml_status llama_context::graph_compute(
 
     int n_threads        = use_batch ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = use_batch ? threadpool_batch        : threadpool;
-
-    LLAMA_LOG_DEBUG("%s: requested profile = %s, resolved profile = %s, n_tokens = %u, n_threads = %d, threadpool = %s\n",
-            __func__, compute_profile_to_string(compute_profile), compute_profile_to_string(resolved_profile), n_tokens, n_threads, use_batch ? "batch" : "normal");
 
     if (backend_cpu != nullptr) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
