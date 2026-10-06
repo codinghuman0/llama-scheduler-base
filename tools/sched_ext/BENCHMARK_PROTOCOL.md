@@ -1,6 +1,6 @@
 # Lightweight base measurement protocol
 
-Status: frozen by Step 10.1. This document defines future measurement; Step 10.1 executes no build, inference, benchmark, perf, contention workload, or scheduler activation. No performance result is recorded here. Implementation changes and Step 10.2 execution require separate authorization.
+Status: frozen by Step 10.1, with the explicit Step 10.2 pre-measurement CPU correction and four-phase automation preparation. The correction occurred BEFORE any performance measurement. This document contains no measured performance result. The preparation commit runs no benchmark, inference timing sweep or sched_ext activation; the user executes the four phases later.
 
 ## Purpose and revision identities
 
@@ -39,7 +39,7 @@ Use only `/home/codinghuman/projects/model.gguf`, readable by UID 1000. Its size
 
 The inspected host has an AMD Ryzen 5 5500U with Radeon Graphics, one socket, six physical cores, twelve logical CPUs, one NUMA node, online CPUs `0-11`. SMT is active (`smt/active=1`, `smt/control=on`). Sysfs gives the following sibling evidence; lscpu's displayed core IDs are normalized differently, so the CPU sibling pairs are the binding identity:
 
-| Server CPU | SMT sibling | Sysfs package/core |
+| Core representative | SMT sibling | Sysfs package/core |
 | --- | --- | --- |
 | 0 | 1 | 0/0 |
 | 2 | 3 | 0/1 |
@@ -48,7 +48,9 @@ The inspected host has an AMD Ryzen 5 5500U with Radeon Graphics, one socket, si
 | 8 | 9 | 0/5 |
 | 10 | 11 | 0/6 |
 
-The primary server CPU set is exactly **`0,2,4,6,8,10`**, mask `0x555`, one logical CPU per physical core. Use this set for every server and every server-created TID. Verify it through `os.sched_getaffinity(tid)`. Do not choose alternate CPUs, change SMT globally, sweep threads, use CPU shielding, or isolate CPUs through kernel settings. Pin the single request/control client to CPU **1** in every configuration; pin D's root loader to CPU **1** as well. The idle D launcher inherits the server mask. SMT siblings remain available to ordinary system tasks; background sanity and balanced order control their influence.
+The primary server CPU set is exactly **`0,2,4,6,8`**, mask `0x155`, one logical CPU on each of five physical cores. The remaining physical core **`10,11`** is reserved for campaign housekeeping. Pin the runner/client to CPU **11** and the root helper/D loader to CPU **10**. Preparation/finalization and administrative children use `10,11` where practical. The original six-core allocation put the client/loader on CPU 1, the SMT sibling of server CPU 0. This avoidable sharing was corrected BEFORE any measurement.
+
+Use the server set for every server-created TID and verify it through `os.sched_getaffinity(tid)` before warm-ups and measurement. No benchmark server TID may use CPUs 10/11 or SMT siblings 1/3/5/7/9. Do not fill the unused server siblings, change SMT globally, sweep threads, use CPU shielding, or isolate CPUs through kernel settings. D's unchanged launcher initially inherits the server mask so its child inherits the correct mask; after registration, move only the idle launcher to CPU 11, before warm-ups. Unrelated system tasks are left unchanged.
 
 The inspected kernel is `7.0.0-34-generic`; freeze one kernel/boot environment for a complete campaign. The scheduler's Git freeze is not kernel-specific. Record kernel, boot ID, BTF hash, online/allowed CPUs and topology at campaign start/end. Stop if these change mid-campaign; a different host/kernel requires a separately reviewed protocol amendment, not silent substitution.
 
@@ -58,19 +60,9 @@ Build A, B and C once before measurement. D reuses **the exact C bytes**, includ
 
 Use `/usr/bin/cc` and `/usr/bin/c++`, resolving to GNU gcc/g++ **13.3.0**, CMake **3.28.3**, and GNU Make **4.3** with generator **Unix Makefiles**. Ninja is not installed and is not a dependency. Freeze Release optimization (`-O3 -DNDEBUG`), shared libraries, native architecture (`GGML_NATIVE=ON`, effective `-march=native` on this host), OpenMP, CPU repacking and llamafile behavior equally. No additional `CFLAGS`/`CXXFLAGS`, LTO, sanitizers, profiling, compiler substitution or ccache-based provenance assumptions are allowed. Record full versions, compiler hashes, configure argv, complete caches and compile commands.
 
-Future source/build locations:
+Phase A uses one campaign-owned temporary detached worktree/build at a time, under `benchmark-results/step10/<run-id>/.prepare/<A|B|C>/{source,build}`. It builds each exact revision, extracts the executable and its required project shared-library closure to `artifacts/<A|B|C>/bin/`, then verifies dependency resolution and `--version` before removing only that owned temporary source/build. Do not delete existing development/original/semantic trees. Preserve failed build logs and useful diagnostics. D references C's bundle; there is no D llama build. This sequential extraction replaces the proposed three retained build trees because disk space is limited.
 
-```text
-A_SRC=/home/codinghuman/projects/llama.cpp-original-baseline
-A_BUILD=/home/codinghuman/projects/llama.cpp-original-baseline/build-step10-a
-LW_SRC=/home/codinghuman/projects/llama.cpp-step10-frozen
-B_BUILD=/home/codinghuman/projects/llama.cpp-step10-frozen/build-step10-b
-C_BUILD=/home/codinghuman/projects/llama.cpp-step10-frozen/build-step10-c
-```
-
-The existing A worktree must remain clean at its exact tag. The future `LW_SRC` is one detached worktree at `llama-side-lightweight-v1`, shared by the two distinct B/C build directories. Creating these directories/worktrees is not part of Step 10.1.
-
-The following commands are frozen requirements, **not executed in Step 10.1**:
+The following common options remain frozen. Phase A supplies the exact source/build paths, adds HINT OFF/TRACE OFF for B or HINT ON/TRACE OFF for C, and builds `--target llama-server --parallel 6`:
 
 ```bash
 common=(
@@ -89,12 +81,6 @@ common=(
   -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_MTMD=OFF
   -DLLAMA_OPENSSL=OFF -DLLAMA_SUBPROCESS=ON -DLLAMA_USE_SYSTEM_GGML=OFF
 )
-cmake -S "$A_SRC" -B "$A_BUILD" "${common[@]}"
-cmake -S "$LW_SRC" -B "$B_BUILD" "${common[@]}" -DLLAMA_SCX_PHASE_HINT=OFF -DLLAMA_SCX_PHASE_TRACE=OFF
-cmake -S "$LW_SRC" -B "$C_BUILD" "${common[@]}" -DLLAMA_SCX_PHASE_HINT=ON -DLLAMA_SCX_PHASE_TRACE=OFF
-cmake --build "$A_BUILD" --target llama-server --parallel 6
-cmake --build "$B_BUILD" --target llama-server --parallel 6
-cmake --build "$C_BUILD" --target llama-server --parallel 6
 ```
 
 `LLAMA_BUILD_TOOLS=ON` is required by the common tools/server build gate, but build only the `llama-server` target and dependencies. Require CPU as the only available GGML backend. Compare all execution-relevant cache options/compile flags across A/B/C; record only unavoidable source-revision differences. A predates the HINT/TRACE options and server compute-profile CLI; do not retrofit them or pass unknown options to A. B/C/D use TRACE OFF and `--server-compute-profile-mode legacy`, preserving the `llama_decode()` path. A uses its original `llama_decode()` path without that new flag. No auto/phase compute-profile experiment is part of this protocol.
@@ -112,33 +98,33 @@ For every server, the common arguments are:
 ```text
 -m /home/codinghuman/projects/model.gguf
 --host 127.0.0.1 --port 8096
---n-gpu-layers 0 --threads 6 --threads-batch 6 --threads-http 2
+--n-gpu-layers 0 --threads 5 --threads-batch 5 --threads-http 2
 --ctx-size 2048 --parallel 1 --batch-size 512 --ubatch-size 256
 --flash-attn off --no-ui
 ```
 
-Six compute threads match six physical cores and avoid the old logical-thread oversubscription experiment. Batch threads are explicitly six as well, rather than an inherited/default value. HTTP threads are explicitly two. Pin with `taskset -c 0,2,4,6,8,10` before exec; verify all observed TID affinities and policies outside timed requests. Use one client, one non-streaming request at a time. Reserve loopback port 8096 before the campaign; stop rather than silently choose a new port if unavailable.
+Five compute threads match the five allocated physical server cores and avoid the old logical-thread oversubscription experiment. Batch threads are explicitly five as well, rather than an inherited/default value. HTTP threads are explicitly two. Pin with `taskset -c 0,2,4,6,8` before exec; verify all observed TID affinities and policies outside timed requests. Use one client, one non-streaming request at a time. Reserve loopback port 8096 before the campaign; stop rather than silently choose a new port if unavailable.
 
-Launch from a controlled environment: remove inherited `LLAMA_ARG_*`, `GGML_*`, `OMP_*`, `OPENBLAS_*`, `MKL_*`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `CFLAGS` and `CXXFLAGS` overrides; set `OMP_NUM_THREADS=6` and `OMP_DYNAMIC=FALSE`. Leave other OpenMP tuning unset and record relevant environment/runtime library identity. Do not expose unrelated environment secrets in manifests. Keep client implementation, CPU affinity, JSON bytes, HTTP/1.1 connection policy and response handling equal across A/B/C/D. Use a fresh HTTP connection per request with `Connection: close`, no automatic retry, and a 180-second timeout.
+Launch from a controlled environment: remove inherited `LLAMA_ARG_*`, `GGML_*`, `OMP_*`, `OPENBLAS_*`, `MKL_*`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `CFLAGS` and `CXXFLAGS` overrides; set `OMP_NUM_THREADS=5` and `OMP_DYNAMIC=FALSE`, then set only the validated bundle-local `LD_LIBRARY_PATH=<bundle>/bin`. Leave other OpenMP tuning unset and record relevant environment/runtime library identity. Do not expose unrelated environment secrets in manifests. Keep client implementation, CPU affinity, JSON bytes, HTTP/1.1 connection policy and response handling equal across A/B/C/D. Use a fresh HTTP connection per request with `Connection: close`, no automatic retry, and a 180-second timeout.
 
 For A/B/C, sched_ext must be disabled and all server TIDs must return raw policy 0. C still calls its HINT marker but has no attached scheduler uprobe.
 
-For D, use the frozen loader/launcher and exactly C's server/marker paths. The root command, executed later through the established human privilege bridge or an explicitly authorized equivalent supervisor, is conceptually:
+For D, use the frozen loader/launcher and exactly C's server/marker paths. The root command, executed later by the narrow Phase B privileged helper, is conceptually:
 
 ```bash
-sudo taskset -c 1 /home/codinghuman/projects/llama.cpp-lightweight/tools/sched_ext/build/bin/llama_scx \
+sudo taskset -c 10 /home/codinghuman/projects/llama.cpp-lightweight/tools/sched_ext/build/bin/llama_scx \
   --phase-uid 1000 --phase-register-socket "@$SOCKET_NAME" \
-  --server-exe "$C_BUILD/bin/llama-server" \
-  --marker-elf "$C_BUILD/bin/libllama-server-impl.so"
+  --server-exe "$C_BUNDLE/bin/llama-server" \
+  --marker-elf "$C_BUNDLE/bin/libllama-server-impl.so"
 ```
 
 The existing loader embeds the absolute BPF-object path under `tools/sched_ext/build/`; verify that object hash. There is no new object-path CLI. Choose `SOCKET_NAME=llama_scx_step10_<run-id>_<visit-id>` with total abstract name length below 108 bytes. The normal-user command uses the validated one-shot registration launcher:
 
 ```bash
-taskset -c 0,2,4,6,8,10 /home/codinghuman/projects/llama.cpp-lightweight/tools/sched_ext/build/bin/llama_scx_child \
-  --phase-register-socket "@$SOCKET_NAME" -- "$C_BUILD/bin/llama-server" \
+taskset -c 0,2,4,6,8 /home/codinghuman/projects/llama.cpp-lightweight/tools/sched_ext/build/bin/llama_scx_child \
+  --phase-register-socket "@$SOCKET_NAME" -- "$C_BUNDLE/bin/llama-server" \
   -m /home/codinghuman/projects/model.gguf --host 127.0.0.1 --port 8096 \
-  --n-gpu-layers 0 --threads 6 --threads-batch 6 --threads-http 2 \
+  --n-gpu-layers 0 --threads 5 --threads-batch 5 --threads-http 2 \
   --ctx-size 2048 --parallel 1 --batch-size 512 --ubatch-size 256 \
   --flash-attn off --no-ui --server-compute-profile-mode legacy
 ```
@@ -196,7 +182,7 @@ Measured order consists of 10 four-config blocks, using left rotation of ABCD by
 | 9 | A B C D |
 | 10 | B C D A |
 
-Each config occurs once per block and 10 times overall; its position counts differ by at most one. Persist the complete 40-visit order before starting, including two warm-ups then one measurement per visit. Use IDs `b01-v1-A` through the prescribed last visit, not an unrecorded shuffle. Preserve block identity for paired variability analysis. No thread-count, prompt-size, co-load or compute-profile sweep is part of the primary comparison.
+Each config occurs once per block and 10 times overall; its position counts differ by at most one. Persist the complete 40-visit order before starting, including two warm-ups then one measurement per visit. Use IDs `01-A` through the prescribed last visit `40-A`, with block/position stored explicitly, not an unrecorded shuffle. Preserve block identity for paired variability analysis. No thread-count, prompt-size, co-load or compute-profile sweep is part of the primary comparison.
 
 ## Thermal, frequency and background conditions
 
@@ -253,46 +239,65 @@ Apply the following primarily to B -> C and C -> D, using the worst signed media
 
 A -> B is reported separately as the fork/base implementation delta; it is not attributed to sched_ext. Accept the infrastructure only when both B -> C and C -> D satisfy the gate. Negative slowdown denotes improvement, not evidence of a phase-aware optimization. Do not cherry-pick samples, optimize before measurements, or rename C -> D to framework overhead. Further experiments, reruns or implementation changes need later authorization.
 
-## Future result artifact schema
+## Four-phase execution and result artifact schema
 
-Use the existing ignored `/benchmark-results/` convention, not the tracked archived experiment:
+The user executes these four scripts sequentially, as UID 1000, from the repository:
 
-```text
-/home/codinghuman/projects/llama.cpp-lightweight/benchmark-results/step10/<UTC-run-id>/
-  manifest.json
-  protocol.md
-  machine-start.json
-  machine-end.json
-  workload/prompt.txt
-  workload/request.json
-  order.json
-  builds/A/{identity.json,CMakeCache.txt,compile_commands.json,configure.log,build.log}
-  builds/B/{identity.json,CMakeCache.txt,compile_commands.json,configure.log,build.log}
-  builds/C/{identity.json,CMakeCache.txt,compile_commands.json,configure.log,build.log}
-  builds/D-scheduler-identity.json
-  raw/<visit-id>/
-    command.json
-    registration.json             # D only
-    policies-before.json
-    readiness.jsonl
-    system-before.json
-    warmup-1-response.json
-    warmup-2-response.json
-    measured-response.json
-    measured-client.json
-    system-after.json
-    policies-after.json
-    server.stdout.log
-    server.stderr.log
-    loader.log                    # D only
-    cleanup.json
-  summary/per-run.csv
-  summary/config-summary.csv
-  summary/deltas.csv
-  summary/statistics.json
-  commands.jsonl
+```sh
+./tools/sched_ext/bench/step10_phase_a_prepare.sh
+./tools/sched_ext/bench/step10_phase_b_arm.sh
+# Close Firefox, Codex and unnecessary GUI applications; keep one terminal/TTY.
+./tools/sched_ext/bench/step10_phase_c_campaign.sh
+# Firefox/Codex may reopen after CAMPAIGN_COMPLETE.
+./tools/sched_ext/bench/step10_phase_d_finalize.sh
 ```
 
-Run ID is UTC `YYYYMMDDTHHMMSSZ` with an optional numeric collision suffix; persist it once. Manifest contains protocol document commit/hash, source tag resolutions, model identity, build IDs/hashes, scheduler hashes, kernel/BTF identity, workload hashes, CPU/thread/affinity policy, environment policy, fixed order, readiness limits, metric definitions, validity rules and campaign status. D's identity explicitly references C's hashes. Each raw record links block, visit position, config, warm-up/measured role, HTTP status, exact request hash, raw normal timings, external duration, process identities/policies/affinities and errors. CSV rows include all per-run metric values; summaries carry n/spread/intervals and gate outcome. All raw observations precede assertions; preserve failed/incomplete campaigns and administrative command stderr as well.
+Phase A performs sequential comparable builds and non-inference bundle checks. Phase B revalidates identities, captures the pre-campaign machine/BPF baseline, prints and executes one sudo command to arm a campaign-specific helper on CPU 10. It does not load the scheduler. Phase C is the ONLY measurement phase: unattended interleaved visits, no sudo prompts, no continuous observer, and no interpretation. Phase D validates stored evidence and calculates statistics offline. Each entry point supports `--help` and a strictly read-only `--dry-run`.
 
-Store binaries/models once at their source paths and reference their hashes; do not duplicate them in results. Do not commit generated results or build artifacts. No Step 10.1 result directory, performance result, runner or build is created. No tag is created for this protocol step.
+The helper authenticates Unix SOCK_SEQPACKET peers with SO_PEERCRED (UID 1000) and a per-campaign token; the runner authenticates the root helper PID/UID/starttime. Commands are restricted to HELLO/CHECK, starting the frozen loader for a predefined D visit, STOP, and FINISH/ABORT. Caller-supplied shell commands, paths and loader arguments are forbidden. The helper waits on IPC, signals and the loader pidfd using blocking selectors; no periodic monitor runs. It expires after six hours, with a 20-minute per-loader safety deadline. Normal target termination remains the expected cleanup path. Finite BPF inventories after loader exit are saved at T0/50/100/250/500/1000/2000 ms BEFORE assertions. Never delete BPF objects during observation.
+
+Use the existing ignored `/benchmark-results/` convention:
+
+```text
+benchmark-results/step10/
+  .active-run                     # small automatic run pointer
+  <UTC-run-id>/
+    manifest.json                 # protocol/source/model/tool/affinity identities; status
+    protocol.md
+    artifacts.json                # A/B/C hashes and dependency provenance; D references C
+    artifacts/{A,B,C}/bin/         # required runtime bytes only; no model copy
+    builds/{A,B,C}/                # caches, compile commands, build-info, logs, identities
+    machine.json                  # pre/post campaign snapshots
+    visit-order.json
+    workload/{prompt.txt,request.json}
+    armed.json                    # helper PID/starttime/UID/affinity/socket identity
+    bpf-baseline.json
+    raw/<visit-number>-<config>/
+      visit.json
+      command.json
+      processes.json
+      registration.json           # D only
+      policies-{before,pre-measured,after}.json
+      readiness.json
+      system-{before,after}.json
+      warmup-{1,2}-{response,client}.json
+      measured-{response,client}.json
+      server.{stdout,stderr}.log
+      loader.log                  # D only
+      teardown-bpf-T<0..6>.json    # D; exact identities before assertions
+      root-cleanup.json           # D only
+      cleanup.json
+    bpf-final.json
+    final-cleanup.json
+    CAMPAIGN_COMPLETE
+    raw-runs.csv
+    summary.csv
+    summary.json
+    protocol-validation.json
+    final-report.md
+    commands.jsonl
+```
+
+Run ID is UTC `YYYYMMDDTHHMMSSZ` with an optional numeric collision suffix. Never overwrite a completed or failed campaign. The active-run pointer joins all four phases; it is not a benchmark result. Each visit stores configuration, block/position, exact request/response hashes, build identities, raw timing fields, affinity/policy snapshots, warm-ups and cleanup evidence. Preserve every issued request and every invalid/incomplete visit; abort on failure without replacement samples. The post-campaign manifest confirms model/runtime rehashing so offline interpretation needs no external memory.
+
+The external POST timer excludes JSON decoding, result serialization, readiness, warm-ups, startup and cleanup. During it the client blocks on HTTP, the privileged helper blocks on events, and no ps/bpftool/temperature/frequency/phase observer runs. Pre/post checkpoints and bounded readiness are outside the timer. No benchmarks are executed in the preparation commit. No model is copied, generated artifacts/results are untracked, and no tag or push is created.
