@@ -62,7 +62,7 @@ Use `/usr/bin/cc` and `/usr/bin/c++`, resolving to GNU gcc/g++ **13.3.0**, CMake
 
 Phase A uses one campaign-owned temporary detached worktree/build at a time, under `benchmark-results/step10/<run-id>/.prepare/<A|B|C>/{source,build}`. It builds each exact revision, extracts the executable and its required project shared-library closure to `artifacts/<A|B|C>/bin/`, then verifies dependency resolution and `--version` before removing only that owned temporary source/build. Do not delete existing development/original/semantic trees. Preserve failed build logs and useful diagnostics. D references C's bundle; there is no D llama build. This sequential extraction replaces the proposed three retained build trees because disk space is limited.
 
-The following common options remain frozen. Phase A supplies the exact source/build paths, adds HINT OFF/TRACE OFF for B or HINT ON/TRACE OFF for C, and builds `--target llama-server --parallel 6`:
+The following common options remain frozen. Phase A supplies the exact source/build paths, adds HINT OFF/TRACE OFF for B or HINT ON/TRACE OFF for C, and builds `--target llama-server --parallel 2`. The preparation job limit was reduced before measurement to reduce memory pressure; compiler flags and measured runtime settings are unchanged. Configure/build logs stream to disk. Verified existing bundles may be reused without rebuilding:
 
 ```bash
 common=(
@@ -241,18 +241,17 @@ A -> B is reported separately as the fork/base implementation delta; it is not a
 
 ## Four-phase execution and result artifact schema
 
-The user executes these four scripts sequentially, as UID 1000, from the repository:
+The user closes Firefox, every Codex UI/CLI session and unnecessary applications BEFORE Phase A, then executes these four scripts sequentially as UID 1000 from one terminal or text console. Keep applications closed until Phase D finishes. A text console (Ctrl+Alt+F3, normal-user login) is recommended on this host because the user journal recorded a GNOME Terminal server SIGSEGV after a successful non-inference bundle-reuse preparation. Switching consoles does not close GUI applications. This workflow change occurs before measurement and leaves the frozen workload and comparisons unchanged:
 
 ```sh
 ./tools/sched_ext/bench/step10_phase_a_prepare.sh
 ./tools/sched_ext/bench/step10_phase_b_arm.sh
-# Close Firefox, Codex and unnecessary GUI applications; keep one terminal/TTY.
 ./tools/sched_ext/bench/step10_phase_c_campaign.sh
-# Firefox/Codex may reopen after CAMPAIGN_COMPLETE.
 ./tools/sched_ext/bench/step10_phase_d_finalize.sh
+# Firefox/Codex may reopen only after Phase D reports completion.
 ```
 
-Phase A performs sequential comparable builds and non-inference bundle checks. Phase B revalidates identities, captures the pre-campaign machine/BPF baseline, prints and executes one sudo command to arm a campaign-specific helper on CPU 10. It does not load the scheduler. Phase C is the ONLY measurement phase: unattended interleaved visits, no sudo prompts, no continuous observer, and no interpretation. Phase D validates stored evidence and calculates statistics offline. Each entry point supports `--help` and a strictly read-only `--dry-run`.
+Every phase rejects detected interactive/benchmark applications before work. Phase A stops only identity-verified leftover user-owned managed Codex daemons after the UI/CLI has closed, then performs sequential comparable builds and non-inference bundle checks. `--reuse-artifacts` instead validates and hardlinks prior exact A/B/C bundles, with no build and no measurement reuse. It can supersede an unused PREPARED campaign only when no arming record, raw visit or completion marker exists; the old directory/evidence remains. Reuse checks frozen build/request/metric/repetition identities and the saved protocol hash, so workflow-only documentation changes can preserve identical runtime bytes. The new campaign records both source and current protocol identities. Phase B revalidates identities, captures the pre-campaign machine/BPF baseline, prints and executes one sudo command to arm a campaign-specific helper on CPU 10. It does not load the scheduler. Phase C is the ONLY measurement phase: unattended interleaved visits, no sudo prompts, no continuous observer, and no interpretation. Phase D validates stored evidence and calculates statistics offline. Each entry point supports `--help` and a strictly read-only `--dry-run`; diagnostics do not execute a phase. SIGHUP/SIGINT/SIGTERM request bounded cleanup, and interrupted build commands release only their owned process groups.
 
 The helper authenticates Unix SOCK_SEQPACKET peers with SO_PEERCRED (UID 1000) and a per-campaign token; the runner authenticates the root helper PID/UID/starttime. Commands are restricted to HELLO/CHECK, starting the frozen loader for a predefined D visit, STOP, and FINISH/ABORT. Caller-supplied shell commands, paths and loader arguments are forbidden. The helper waits on IPC, signals and the loader pidfd using blocking selectors; no periodic monitor runs. It expires after six hours, with a 20-minute per-loader safety deadline. Normal target termination remains the expected cleanup path. Finite BPF inventories after loader exit are saved at T0/50/100/250/500/1000/2000 ms BEFORE assertions. Never delete BPF objects during observation.
 

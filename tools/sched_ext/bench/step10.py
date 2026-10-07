@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0
-"""Four explicit phases. Only campaign() can issue completion requests."""
+"""Keep Firefox/Codex closed from Phase A through Phase D; use one terminal/TTY. Only campaign() issues completion requests."""
 import argparse
 import datetime
 import hashlib
@@ -38,6 +38,7 @@ CMAKE_OPTIONS = [
     '-DLLAMA_BUILD_APP=OFF', '-DLLAMA_BUILD_UI=OFF', '-DLLAMA_USE_PREBUILT_UI=OFF', '-DLLAMA_BUILD_MTMD=OFF',
     '-DLLAMA_OPENSSL=OFF', '-DLLAMA_SUBPROCESS=ON', '-DLLAMA_USE_SYSTEM_GGML=OFF',
 ]
+BUILD_JOBS = 2
 
 
 def sources():
@@ -126,8 +127,8 @@ def build_bundle(run, config):
     if config != 'A':
         argv += ['-DLLAMA_SCX_PHASE_HINT=' + ('ON' if config == 'C' else 'OFF'), '-DLLAMA_SCX_PHASE_TRACE=OFF']
     write_json(metadata / 'configure-command.json', argv)
-    audit_command(run, argv, env=env, log=metadata / 'configure.log')
-    audit_command(run, ['cmake', '--build', build, '--target', 'llama-server', '--parallel', '6'], env=env, log=metadata / 'build.log')
+    audit_command(run, argv, env=env, log=metadata / 'configure.log', capture=False)
+    audit_command(run, ['cmake', '--build', build, '--target', 'llama-server', '--parallel', str(BUILD_JOBS)], env=env, log=metadata / 'build.log', capture=False)
     free_space(run)
     cache = (build / 'CMakeCache.txt').read_text()
     cache_values = dict(re.findall(r'^([^/#\n][^:\n]*):[^=\n]+=(.*)$', cache, re.M))
@@ -210,11 +211,25 @@ def validate_artifacts(run, *, model=False, offline=False):
     return artifacts
 
 
+def unused_preparation(run, manifest):
+    return (manifest['status'] == 'PREPARED' and (run / 'raw').is_dir() and not any((run / 'raw').iterdir())
+            and not (run / 'armed.json').exists() and not (run / 'CAMPAIGN_COMPLETE').exists())
+
+
+def replaceable_campaign(run):
+    manifest = read_json(run / 'manifest.json')
+    return manifest['status'] in {'FAILED', 'FINALIZED', 'SUPERSEDED'} or unused_preparation(run, manifest)
+
+
 def reuse_bundles(run, previous, tools):
     old = read_json(previous / 'manifest.json')
-    require(old['status'] in {'FAILED', 'FINALIZED'}, 'Only closed campaigns may provide reusable bundles')
+    require(replaceable_campaign(previous), 'Only closed or unused PREPARED campaigns may provide reusable bundles')
     require(toolchain_identity(old['toolchain']) == toolchain_identity(tools) and old['tags'] == TAGS and old['topology'] == topology()
-            and old['protocol'] == protocol_identity(), 'Reusable build/toolchain/protocol identity differs')
+            and old['request_sha256'] == REQUEST_SHA and old['prompt_sha256'] == PROMPT_SHA
+            and old['metrics'] == list(analysis.METRICS) and old['warmups_per_visit'] == 2 and old['measured_per_config'] == 10
+            and old['bootstrap_seed'] == 20261006 and old['bootstrap_draws'] == 10000
+            and old['order'] == order() and old['scheduler_hashes'] == SCHED_HASHES and old['uid'] == 1000
+            and sha(previous / 'protocol.md') == old['protocol']['sha256'], 'Reusable build/toolchain/measurement identity differs')
     artifacts = validate_artifacts(previous)
     for cfg in 'ABC':
         record = artifacts[cfg]
@@ -242,7 +257,8 @@ def reuse_bundles(run, previous, tools):
         require(version == record['version'], 'Reused server version differs')
         write_json(run / 'builds' / cfg / 'reuse-validation.json', dict(bundle_ldd=ldd, version=version))
     write_json(run / 'artifacts.json', artifacts)
-    write_json(run / 'reused-artifacts.json', dict(source=str(previous), source_head=old['head'], files={cfg: artifacts[cfg]['files'] for cfg in 'ABC'}))
+    write_json(run / 'reused-artifacts.json', dict(source=str(previous), source_head=old['head'], source_protocol=old['protocol'],
+                                                files={cfg: artifacts[cfg]['files'] for cfg in 'ABC'}))
     return artifacts
 
 
@@ -260,8 +276,7 @@ def prepare(*, reuse_artifacts=False):
     previous_run = None
     if pointer.exists():
         previous_run = active_run()
-        previous = read_json(previous_run / 'manifest.json')
-        require(previous['status'] in {'FAILED', 'FINALIZED'}, 'Previous campaign must be finalized or explicitly failed first')
+        require(replaceable_campaign(previous_run), 'Previous campaign is armed/running or contains requests; do not replace it')
     require(not reuse_artifacts or previous_run is not None, 'No previous campaign bundles to reuse')
     name = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     run = RESULTS / name
@@ -270,6 +285,13 @@ def prepare(*, reuse_artifacts=False):
         suffix += 1
         run = RESULTS / f'{name}-{suffix}'
     run.mkdir()
+    if previous_run:
+        with locked(previous_run):
+            previous = read_json(previous_run / 'manifest.json')
+            require(replaceable_campaign(previous_run), 'Previous campaign state changed')
+            if unused_preparation(previous_run, previous):
+                change_status(previous_run, 'SUPERSEDED', replacement=run.name,
+                              reason='Unused preparation replaced before arming or requests; original artifacts/evidence retained')
     (RESULTS / '.active-run.tmp').write_text(run.name + '\n')
     os.replace(RESULTS / '.active-run.tmp', pointer)
     for directory in ('workload', 'raw'):
@@ -285,7 +307,7 @@ def prepare(*, reuse_artifacts=False):
                     clock=vars(time.get_clock_info('perf_counter')), kernel=os.uname().release,
                     boot_id=BOOT_ID.read_text().strip(), btf_sha256=sha('/sys/kernel/btf/vmlinux'),
                     metrics=list(analysis.METRICS), warmups_per_visit=2, measured_per_config=10,
-                    bootstrap_seed=20261006, bootstrap_draws=10000)
+                    bootstrap_seed=20261006, bootstrap_draws=10000, quiet_all_phases=True, build_jobs=BUILD_JOBS)
     write_json(run / 'manifest.json', manifest)
     try:
         with locked(run):
@@ -305,7 +327,7 @@ def prepare(*, reuse_artifacts=False):
     except BaseException as error:
         change_status(run, 'FAILED', error=str(error))
         raise
-    print(f'Phase A complete: {run}\nNext: ./tools/sched_ext/bench/step10_phase_b_arm.sh')
+    print(f'Phase A complete: {run}\nKeep applications closed through Phase D.\nNext: ./tools/sched_ext/bench/step10_phase_b_arm.sh')
 
 
 def arm():
@@ -339,12 +361,8 @@ def arm():
                     write_json(run / 'arming-cleanup-error.json', dict(error=str(cleanup), helper=ready['helper']))
             change_status(run, 'FAILED', error=str(error))
             raise
-    print('Preparation complete. Do not start the benchmark while Firefox/Codex are open.\n'
-          'Close Firefox, all Codex UI/CLI sessions and unnecessary GUI applications. Keep one terminal or TTY.\n'
-          'Codex managed daemons can remain after closing its window. From that terminal run:\n'
-          './tools/sched_ext/bench/step10_phase_c_campaign.sh --stop-codex-daemons\n'
-          './tools/sched_ext/bench/step10_phase_c_campaign.sh --check-ready\n'
-          'Then run: ./tools/sched_ext/bench/step10_phase_c_campaign.sh')
+    print('Phase B complete. Keep Firefox/Codex and unnecessary applications closed through Phase D.\n'
+          'From the same terminal or TTY run: ./tools/sched_ext/bench/step10_phase_c_campaign.sh')
 
 
 def server_argv(run, config):
@@ -628,7 +646,7 @@ def campaign():
                 write_json(run / 'abort-cleanup-error.json', dict(error=str(cleanup)))
             change_status(run, 'FAILED', error=str(error), invalid_block=plan['block'] if plan else None)
             raise
-    print('CAMPAIGN_COMPLETE. Firefox/Codex may now be reopened.\nNext: ./tools/sched_ext/bench/step10_phase_d_finalize.sh')
+    print('CAMPAIGN_COMPLETE. Keep applications closed until Phase D finishes.\nNext: ./tools/sched_ext/bench/step10_phase_d_finalize.sh')
 
 
 def check_ready():
@@ -712,44 +730,60 @@ def finalize():
         except Exception as error:
             write_json(run / 'protocol-validation.json', dict(status='FAIL', error=str(error)))
             raise
-    print(f'Phase D complete: {run / "final-report.md"}')
+    print(f'Phase D complete: {run / "final-report.md"}\nFirefox/Codex may now be reopened.')
 
 
 def dry_run(phase, *, reuse_artifacts=False, quiet_mode=None):
     # No campaign state, binaries, network requests, privilege or builds are used.
-    actions = {'prepare': ['verify', 'sequential A/B/C server-only builds', 'extract/validate --version', 'remove owned temporary builds'],
-               'arm': ['validate artifacts', 'snapshot machine', 'one sudo helper start; no sched_ext activation'],
-               'campaign': ['reject Firefox/Codex', '40 interleaved fresh-server visits; 2 warmups + 1 measurement each', 'cleanup and helper exit'],
-               'finalize': ['validate saved evidence', 'descriptive statistics', '10000 paired-block bootstrap draws']}
+    actions = {'prepare': ['stop only verified leftover managed Codex daemons after UI/CLI closes', 'reject interactive applications', 'verify', 'sequential A/B/C server-only builds; two compile jobs', 'extract/validate --version', 'remove owned temporary builds'],
+               'arm': ['reject interactive applications', 'validate artifacts', 'snapshot machine', 'one sudo helper start; no sched_ext activation'],
+               'campaign': ['reject interactive applications', '40 interleaved fresh-server visits; 2 warmups + 1 measurement each', 'cleanup and helper exit'],
+               'finalize': ['reject interactive applications', 'validate saved evidence', 'descriptive statistics', '10000 paired-block bootstrap draws', 'applications may reopen']}
     if reuse_artifacts:
-        actions['prepare'] = ['verify', 'validate/share previous A/B/C bundles; --version only; no builds']
+        actions['prepare'] = actions['prepare'][:3] + ['validate/share previous closed or unused A/B/C bundles; --version only; no builds']
     if quiet_mode == 'check-ready':
-        actions['campaign'] = ['read-only application/port/power checks; no requests']
+        actions[phase] = ['read-only application/port/power checks; no requests']
     elif quiet_mode == 'stop-codex-daemons':
-        actions['campaign'] = ['verify managed daemon identities and closed UI/CLI', 'SIGTERM only those UID-1000 daemons; no requests']
+        actions[phase] = ['verify managed daemon identities and closed UI/CLI', 'SIGTERM only those UID-1000 daemons; no requests']
     print(json.dumps(dict(phase=phase, dry_run=True, repository=str(REPO), results=str(RESULTS),
                           pointer=str(RESULTS / '.active-run'), server_cpus=sorted(SERVER_CPUS), runner_client_cpu=11,
                           helper_loader_cpu=10, compute_threads=5, batch_threads=5, order=order(),
                           prompt_sha256=PROMPT_SHA, request_sha256=REQUEST_SHA, revisions=REVISIONS,
-                          d_reuses='C', only_measurement_phase='campaign', actions=actions[phase]), indent=2))
+                          d_reuses='C', only_measurement_phase='campaign', quiet_all_phases=True, build_jobs=BUILD_JOBS,
+                          actions=actions[phase]), indent=2))
+
+
+def run_phase(phase, *, reuse_artifacts=False):
+    if phase == 'prepare':
+        stopped = machine.stop_codex_daemons()
+        if stopped:
+            print('Stopped verified leftover managed Codex daemons: ' + ', '.join(str(p['pid']) for p in stopped), flush=True)
+    machine.reject_interactive_apps()
+    if phase == 'prepare':
+        prepare(reuse_artifacts=reuse_artifacts)
+    else:
+        globals()[phase]()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('phase', choices=('prepare', 'arm', 'campaign', 'finalize'))
     parser.add_argument('--dry-run', action='store_true', help='Print the immutable plan; perform no operations')
-    parser.add_argument('--reuse-artifacts', action='store_true', help='Phase A only: validate and reuse previous closed campaign bundles in a new campaign')
+    parser.add_argument('--reuse-artifacts', action='store_true', help='Phase A only: validate and reuse previous closed/unused prepared bundles in a new campaign')
     quiet_options = parser.add_mutually_exclusive_group()
-    quiet_options.add_argument('--check-ready', action='store_true', help='Phase C only: read-only application/port/power checks; do not start the campaign')
-    quiet_options.add_argument('--stop-codex-daemons', action='store_true', help='Phase C only: after closing UI/CLI, stop only your verified managed Codex daemons; no campaign requests')
+    quiet_options.add_argument('--check-ready', action='store_true', help='Read-only application/port/power checks; do not execute the phase')
+    quiet_options.add_argument('--stop-codex-daemons', action='store_true', help='After closing UI/CLI, stop only verified managed Codex daemons; do not execute the phase')
     args = parser.parse_args()
     require(os.getuid() == 1000, 'Run phase entry points as codinghuman UID 1000, without sudo')
     require(not args.reuse_artifacts or args.phase == 'prepare', '--reuse-artifacts is only for Phase A')
-    require(not (args.check_ready or args.stop_codex_daemons) or args.phase == 'campaign', 'Quiet checks are only for Phase C')
     if args.dry_run:
         dry_run(args.phase, reuse_artifacts=args.reuse_artifacts,
                 quiet_mode='check-ready' if args.check_ready else 'stop-codex-daemons' if args.stop_codex_daemons else None)
         return
+    def interrupted(signum, _frame):
+        raise RuntimeError(f'Phase interrupted by signal {signum}')
+    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, interrupted)
     if args.stop_codex_daemons:
         stopped = machine.stop_codex_daemons()
         print('Managed Codex daemons stopped: ' + ', '.join(str(p['pid']) for p in stopped) + '. No campaign request issued.')
@@ -757,14 +791,7 @@ def main():
     if args.check_ready:
         check_ready()
         return
-    def interrupted(signum, _frame):
-        raise RuntimeError(f'Phase interrupted by signal {signum}')
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, interrupted)
-    if args.phase == 'prepare':
-        prepare(reuse_artifacts=args.reuse_artifacts)
-    else:
-        globals()[args.phase]()
+    run_phase(args.phase, reuse_artifacts=args.reuse_artifacts)
 
 
 if __name__ == '__main__':

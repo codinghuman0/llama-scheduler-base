@@ -72,7 +72,7 @@ def reject_interactive_apps():
     rows, offenders = interactive_apps()
     require(not offenders, 'Close interactive/benchmark applications first: ' + '; '.join(offenders) +
             '\nClosing the Codex window can leave managed daemons running. Exit all Codex CLI/UI sessions, then run '
-            './tools/sched_ext/bench/step10_phase_c_campaign.sh --stop-codex-daemons '
+            './tools/sched_ext/bench/step10_phase_a_prepare.sh --stop-codex-daemons '
             'from your terminal. This command only stops verified user-owned managed daemons; it does not benchmark.')
     return rows
 

@@ -75,7 +75,37 @@ def write_json(path, value):
     os.replace(temp, path)
 
 
-def command(argv, *, cwd=REPO, env=None, log=None):
+def command(argv, *, cwd=REPO, env=None, log=None, capture=True):
+    if not capture:
+        require(log is not None, 'Streaming command requires a log path')
+        with open(log, 'w') as output:
+            process = subprocess.Popen([str(arg) for arg in argv], cwd=cwd, env=env,
+                                       stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                code = process.wait()
+            except BaseException:
+                # Only this command's new process group receives cleanup signals.
+                if process.returncode is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait(timeout=5)
+                raise
+        if code:
+            with open(log, 'rb') as output:
+                length = output.seek(0, os.SEEK_END)
+                output.seek(max(0, length - 8192))
+                tail = output.read().decode(errors='replace')
+            raise RuntimeError(f'Command failed ({code}): {argv}\nFull log: {log}\n{tail}')
+        return ''
     result = subprocess.run([str(arg) for arg in argv], cwd=cwd, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if log:

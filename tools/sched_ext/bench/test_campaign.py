@@ -9,6 +9,7 @@ import signal
 import socket
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -27,6 +28,129 @@ def response():
 
 
 class CampaignTests(unittest.TestCase):
+    def test_all_phases_require_closed_apps_before_work(self):
+        for phase in ('prepare', 'arm', 'campaign', 'finalize'):
+            with self.subTest(phase=phase), patch.object(machine, 'stop_codex_daemons', return_value=[]) as stop, \
+                 patch.object(machine, 'reject_interactive_apps', side_effect=RuntimeError('application active')), \
+                 patch.object(step10, phase) as execute:
+                with self.assertRaisesRegex(RuntimeError, 'application active'):
+                    step10.run_phase(phase)
+                execute.assert_not_called()
+                self.assertEqual(stop.call_count, int(phase == 'prepare'))
+
+    def test_quiet_preparation_reaps_daemons_before_reuse(self):
+        events = []
+        with patch.object(machine, 'stop_codex_daemons', side_effect=lambda: events.append('stop') or []), \
+             patch.object(machine, 'reject_interactive_apps', side_effect=lambda: events.append('check')), \
+             patch.object(step10, 'prepare', side_effect=lambda **_: events.append('prepare')) as execute:
+            step10.run_phase('prepare', reuse_artifacts=True)
+        self.assertEqual(events, ['stop', 'check', 'prepare'])
+        execute.assert_called_once_with(reuse_artifacts=True)
+
+    def test_hangup_handler_requests_normal_phase_cleanup(self):
+        handlers = {}
+        with patch.object(sys, 'argv', ['step10.py', 'prepare']), \
+             patch.object(step10.signal, 'signal', side_effect=lambda sig, handler: handlers.__setitem__(sig, handler)), \
+             patch.object(step10, 'run_phase') as execute:
+            step10.main()
+            execute.assert_called_once_with('prepare', reuse_artifacts=False)
+        self.assertEqual(set(handlers), {signal.SIGHUP, signal.SIGINT, signal.SIGTERM})
+        with self.assertRaisesRegex(RuntimeError, 'interrupted by signal'):
+            handlers[signal.SIGHUP](signal.SIGHUP, None)
+
+    def test_unused_preparation_replacement_refuses_any_runtime_or_request(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp)
+            (run / 'raw').mkdir()
+            common.write_json(run / 'manifest.json', dict(status='PREPARED'))
+            self.assertTrue(step10.replaceable_campaign(run))
+            for path in (run / 'armed.json', run / 'raw/01-A', run / 'CAMPAIGN_COMPLETE'):
+                path.write_text('evidence')
+                self.assertFalse(step10.replaceable_campaign(run))
+                path.unlink()
+            for status in ('ARMED', 'RUNNING', 'CAMPAIGN_COMPLETE', 'PREPARING'):
+                common.write_json(run / 'manifest.json', dict(status=status))
+                self.assertFalse(step10.replaceable_campaign(run))
+            common.write_json(run / 'manifest.json', dict(status='FAILED'))
+            self.assertTrue(step10.replaceable_campaign(run))
+
+    def test_reuse_preparation_supersedes_only_unused_run_and_preserves_evidence(self):
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
+            root = Path(temp)
+            results = root / 'results'
+            previous = results / '20261006T010203Z'
+            (previous / 'raw').mkdir(parents=True)
+            (previous / 'evidence.txt').write_text('retain original preparation')
+            common.write_json(previous / 'manifest.json', dict(status='PREPARED'))
+            (results / '.active-run').write_text(previous.name)
+            protocol = root / 'tools/sched_ext/BENCHMARK_PROTOCOL.md'
+            protocol.parent.mkdir(parents=True)
+            protocol.write_text('synthetic protocol')
+            cache = dict(option[2:].split('=', 1) for option in step10.CMAKE_OPTIONS if option.startswith('-D'))
+            artifacts = {cfg: dict(cache_subset=cache, files={}) for cfg in 'ABC'}
+            for module in (common, step10):
+                stack.enter_context(patch.object(module, 'RESULTS', results))
+            stack.enter_context(patch.object(step10, 'REPO', root))
+            stack.enter_context(patch.object(step10, 'repo_check', return_value='fixture'))
+            stack.enter_context(patch.object(step10, 'scheduler_check'))
+            stack.enter_context(patch.object(step10, 'state', return_value='disabled'))
+            stack.enter_context(patch.object(step10, 'live_project_processes', return_value=[]))
+            stack.enter_context(patch.object(step10, 'topology', return_value={}))
+            stack.enter_context(patch.object(step10, 'model_identity', return_value={}))
+            stack.enter_context(patch.object(step10, 'toolchain', return_value={}))
+            stack.enter_context(patch.object(step10, 'validate_entry_points'))
+            stack.enter_context(patch.object(step10, 'require_no_helper'))
+            stack.enter_context(patch.object(step10, 'sources', return_value={}))
+            stack.enter_context(patch.object(step10, 'sha', return_value='fixture'))
+            stack.enter_context(patch.object(step10, 'protocol_identity', return_value={}))
+            stack.enter_context(patch.object(step10, 'validate_artifacts'))
+            reuse = stack.enter_context(patch.object(step10, 'reuse_bundles', return_value=artifacts))
+            build = stack.enter_context(patch.object(step10, 'build_bundle'))
+            stack.enter_context(patch('builtins.print'))
+            step10.prepare(reuse_artifacts=True)
+            new = common.active_run()
+            old = common.read_json(previous / 'manifest.json')
+            self.assertNotEqual(new, previous)
+            self.assertEqual(old['status'], 'SUPERSEDED')
+            self.assertEqual(old['replacement'], new.name)
+            self.assertEqual((previous / 'evidence.txt').read_text(), 'retain original preparation')
+            self.assertEqual(common.read_json(new / 'manifest.json')['status'], 'PREPARED')
+            self.assertTrue(common.read_json(new / 'manifest.json')['quiet_all_phases'])
+            self.assertEqual(list((new / 'raw').iterdir()), [])
+            reuse.assert_called_once_with(new, previous, {})
+            build.assert_not_called()
+
+    def test_command_streams_large_output_and_preserves_failure_log(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'build.log'
+            result = common.command([sys.executable, '-c', 'print("fixture" * 100000)'], log=log, capture=False)
+            self.assertEqual(result, '')
+            self.assertEqual(log.stat().st_size, 700001)
+            with self.assertRaisesRegex(RuntimeError, 'Full log:') as caught:
+                common.command([sys.executable, '-c', 'print("failure" * 100000); raise SystemExit(2)'], log=log, capture=False)
+            self.assertEqual(log.stat().st_size, 700001)
+            self.assertLess(len(str(caught.exception)), 9000)
+
+    def test_interrupted_streaming_command_reaps_only_owned_process_group(self):
+        process = subprocess.Popen(['/usr/bin/sleep', '30'], start_new_session=True)
+        wait = process.wait
+        calls = [0]
+        def interrupted_wait(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise RuntimeError('synthetic hangup')
+            return wait(*args, **kwargs)
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch.object(common.subprocess, 'Popen', return_value=process), \
+                 patch.object(process, 'wait', side_effect=interrupted_wait):
+                with self.assertRaisesRegex(RuntimeError, 'synthetic hangup'):
+                    common.command(['/usr/bin/sleep', '30'], log=Path(temp) / 'build.log', capture=False)
+            self.assertEqual(process.poll(), -signal.SIGTERM)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                wait()
+
     def test_port_check_rejects_a_live_listener(self):
         with socket.socket() as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -282,7 +406,13 @@ class CampaignTests(unittest.TestCase):
             run.mkdir()
             tools = dict(versions=dict(make='GNU Make 4.3\nOriginal localized license'), compiler_hashes={'cc':'fixture'})
             current_tools = tools | dict(versions=dict(make='GNU Make 4.3\nDifferent localized license'))
-            common.write_json(previous/'manifest.json', dict(status='FAILED', head='fixture', toolchain=tools, tags=common.TAGS, topology={}, protocol={}))
+            (previous/'protocol.md').write_text('saved protocol with the previous workflow')
+            old_manifest = dict(status='FAILED', head='fixture', toolchain=tools, tags=common.TAGS, topology={},
+                                protocol={'sha256':common.sha(previous/'protocol.md')}, request_sha256=common.REQUEST_SHA,
+                                prompt_sha256=common.PROMPT_SHA, metrics=list(analysis.METRICS), warmups_per_visit=2,
+                                measured_per_config=10, bootstrap_seed=20261006, bootstrap_draws=10000,
+                                order=common.order(), scheduler_hashes=common.SCHED_HASHES, uid=1000)
+            common.write_json(previous/'manifest.json', old_manifest)
             artifacts = {}
             for cfg in 'ABC':
                 bundle, metadata = previous/'artifacts'/cfg, previous/'builds'/cfg
@@ -299,7 +429,7 @@ class CampaignTests(unittest.TestCase):
                 common.write_json(metadata/'identity.json', record)
             (previous/'raw').mkdir()
             (previous/'raw/failed-sample.json').write_text('must stay in old campaign')
-            with patch.object(step10, 'topology', return_value={}), patch.object(step10, 'protocol_identity', return_value={}), \
+            with patch.object(step10, 'topology', return_value={}), patch.object(step10, 'protocol_identity', return_value={'sha256':'workflow-only amendment'}), \
                  patch.object(step10, 'validate_artifacts', return_value=artifacts), \
                  patch.object(step10, 'dependencies', return_value=('synthetic dependency resolution', [])), \
                  patch.object(step10, 'audit_command', return_value='fixture') as commands:
@@ -311,6 +441,13 @@ class CampaignTests(unittest.TestCase):
                     self.assertEqual((old.stat().st_ino, old.stat().st_dev), (new.stat().st_ino, new.stat().st_dev))
                 self.assertFalse((run/'raw').exists())
                 self.assertEqual((previous/'raw/failed-sample.json').read_text(), 'must stay in old campaign')
+                self.assertEqual(common.read_json(run/'reused-artifacts.json')['source_protocol'], old_manifest['protocol'])
+                old_manifest['request_sha256'] = 'different workload'
+                common.write_json(previous/'manifest.json', old_manifest)
+                with self.assertRaisesRegex(RuntimeError, 'measurement identity differs'):
+                    step10.reuse_bundles(Path(temp)/'changed-request', previous, current_tools)
+                old_manifest['request_sha256'] = common.REQUEST_SHA
+                common.write_json(previous/'manifest.json', old_manifest)
                 damaged = artifacts['B']['cache_subset']
                 damaged['GGML_CUDA'] = 'ON'
                 another = Path(temp)/'invalid'
@@ -373,6 +510,11 @@ class CampaignTests(unittest.TestCase):
                     return 'synthetic ELF identity'
                 def fake_audit(_run, argv, **_kwargs):
                     events.append([str(a) for a in argv])
+                    if argv[0] == 'cmake':
+                        self.assertFalse(_kwargs['capture'])
+                        self.assertIn('log', _kwargs)
+                        if '--build' in argv:
+                            self.assertEqual(argv[argv.index('--parallel')+1], '2')
                     if argv[:3] == ['git','worktree','add']:
                         source = Path(argv[4])
                         (source / 'common').mkdir(parents=True)
