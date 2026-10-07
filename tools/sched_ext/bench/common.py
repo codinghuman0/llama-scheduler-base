@@ -134,6 +134,8 @@ def live_project_processes():
 
 def port_free():
     with socket.socket() as probe:
+        # Match the server's reuse rule without allowing a second listener.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         probe.bind(('127.0.0.1', PORT))
 
 

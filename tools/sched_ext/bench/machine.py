@@ -3,9 +3,10 @@
 import os
 from pathlib import Path
 import re
+import signal
 import time
 
-from common import BOOT_ID, command, require, topology, write_json
+from common import BOOT_ID, command, identity, require, same_process, signal_exact, topology, write_json
 
 
 def snapshot():
@@ -53,7 +54,7 @@ def busy(before, after):
     return 100 * (1 - (after[1] - before[1]) / total)
 
 
-def reject_interactive_apps():
+def interactive_apps():
     rows = command(['ps', '-eo', 'pid=,comm=,pcpu=,args=']).splitlines()
     offenders = []
     for row in rows:
@@ -64,8 +65,63 @@ def reject_interactive_apps():
         comm = comm.lower()
         if comm.startswith(('firefox', 'codex')) or comm in {'stress-ng', 'perf', 'cmake', 'make', 'ninja', 'cc1', 'cc1plus', 'wget', 'curl'} or (comm in {'node', 'electron'} and re.search(r'(^|[/ .-])codex([/ .-]|$)', argv, re.I)):
             offenders.append(row.strip())
-    require(not offenders, 'Close interactive/benchmark applications first: ' + '; '.join(offenders))
+    return rows, offenders
+
+
+def reject_interactive_apps():
+    rows, offenders = interactive_apps()
+    require(not offenders, 'Close interactive/benchmark applications first: ' + '; '.join(offenders) +
+            '\nClosing the Codex window can leave managed daemons running. Exit all Codex CLI/UI sessions, then run '
+            './tools/sched_ext/bench/step10_phase_c_campaign.sh --stop-codex-daemons '
+            'from your terminal. This command only stops verified user-owned managed daemons; it does not benchmark.')
     return rows
+
+
+def managed_codex_daemon(argv):
+    if not argv:
+        return False
+    root = Path.home() / '.codex/packages/app-server-daemon/releases'
+    executable = Path(argv[0])
+    if (not executable.is_relative_to(root) or executable.parent.name != 'bin'
+            or executable.parent.parent.parent != root or executable.parent.parent.name in {'.', '..'}):
+        return False
+    return ((executable.name == 'codex' and argv[1:] in
+             (['app-server', '--listen', 'unix://', '--managed-daemon'], ['app-server', 'daemon', 'pid-update-loop']))
+            or (executable.name == 'codex-code-mode-host' and len(argv) == 1))
+
+
+def stop_codex_daemons():
+    require(os.getuid() == 1000, 'Only the selected normal user may stop their managed daemons')
+    _, offenders = interactive_apps()
+    targets, other = [], []
+    for row in offenders:
+        pid = int(row.split(None, 1)[0])
+        try:
+            argv = Path(f'/proc/{pid}/cmdline').read_bytes().decode().rstrip('\0').split('\0')
+            saved = identity(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if saved['uids'] == [1000] * 4 and managed_codex_daemon(argv):
+            targets.append((saved, argv))
+        else:
+            other.append(row)
+    require(not other, 'Exit interactive applications/CLI sessions before stopping managed daemons: ' + '; '.join(other))
+    # Recheck the complete set before signaling any process.
+    for saved, argv in targets:
+        require(same_process(saved) and Path(f"/proc/{saved['pid']}/cmdline").read_bytes().decode().rstrip('\0').split('\0') == argv,
+                'Daemon identity changed; refusing signal')
+    for saved, _ in reversed(targets):
+        if same_process(saved):
+            try:
+                signal_exact(saved, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    deadline = time.monotonic() + 15
+    while any(same_process(saved) for saved, _ in targets) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    require(not any(same_process(saved) for saved, _ in targets), 'Managed daemon did not exit; no forced kill was sent')
+    reject_interactive_apps()
+    return [saved for saved, _ in targets]
 
 
 def readiness(run, name, baseline, *, after_warmup):
@@ -93,3 +149,18 @@ def readiness(run, name, baseline, *, after_warmup):
         if ready:
             return
     raise RuntimeError('Readiness/cooldown did not settle within 180 seconds')
+
+
+def validate_readiness(readings, baseline, *, after_warmup):
+    require(isinstance(readings, list) and readings and readings[-1]['ready'] is True, 'Readiness evidence missing or did not pass')
+    record = readings[-1]
+    names = ('first', 'second', 'third') if after_warmup else ('first', 'second')
+    for name in names:
+        validate(record[name], baseline)
+    require(0 <= record['busy_pct'] <= 5, 'Saved readiness CPU busy exceeds protocol')
+    if after_warmup:
+        temperatures = [record[name]['tctl_c'] for name in names]
+        require(max(temperatures) <= 55 and max(temperatures) - min(temperatures) <= 2
+                and 0 <= record['second_busy_pct'] <= 5, 'Saved cooldown exceeds protocol')
+    else:
+        require(record['second']['loadavg'][0] <= 1, 'Saved block load exceeds protocol')

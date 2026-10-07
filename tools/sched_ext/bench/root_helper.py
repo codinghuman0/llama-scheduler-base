@@ -19,7 +19,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (RESULTS, SCHED, TAGS, bpf_timeline, canonical, identity,
                     live_project_processes, project_objects, read_json, reduced_bpf,
-                    require, same_process, scheduler_check, sha, signal_exact,
+                    order, require, same_process, scheduler_check, sha, signal_exact,
                     state, write_json)
 
 OPS = {'HELLO', 'CHECK', 'START', 'STOP', 'FINISH', 'ABORT'}
@@ -44,6 +44,7 @@ class Helper:
         self.manifest = read_json(run / 'manifest.json')
         require(self.manifest['status'] == 'PREPARED', 'Campaign is not prepared')
         require(self.manifest['tags'] == TAGS and self.manifest['uid'] == 1000, 'Campaign identity differs')
+        require(self.manifest['order'] == order(), 'Campaign order differs from the fixed loader whitelist')
         for name, digest in self.manifest['helper_sources'].items():
             require(sha(Path(__file__).parent / name) == digest, 'Helper source identity changed')
         scheduler_check()
@@ -89,7 +90,7 @@ class Helper:
 
     def start(self, visit):
         require(self.child is None and state() == 'disabled', 'Scheduler already active')
-        require(self.manifest['order'][visit-1]['config'] == 'D', 'Only a frozen D visit may start the loader')
+        require(order()[visit-1]['config'] == 'D', 'Only a frozen D visit may start the loader')
         require(self.last is None or visit > self.last['visit'], 'Visit cannot be reused')
         require(self.last is None or self.last.get('clean') and self.last['loader_exit'] == 0, 'Previous loader did not cleanly finish')
         scheduler_check()
@@ -106,7 +107,16 @@ class Helper:
         env = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'HOME': '/root'}
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.PIPE, env=env, cwd='/', start_new_session=True)
-        saved = identity(process.pid)
+        try:
+            saved = identity(process.pid)
+        except Exception:
+            # This is our unreaped direct child; its PID cannot be reused yet.
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=15)
+            (path / 'loader.log').write_bytes(process.stderr.read())
+            process.stderr.close()
+            raise
         self.child = dict(process=process, identity=saved, visit=visit, log=path / 'loader.log',
                           socket='@' + registration, pidfd=os.pidfd_open(process.pid),
                           deadline=time.monotonic()+MAX_LOADER_LIFETIME, startup_output=b'', administrative_stop=False)
@@ -170,6 +180,8 @@ class Helper:
     def check(self):
         require(self.child is None and state() == 'disabled', 'Scheduler is still active')
         current = reduced_bpf()
+        if project_objects(current):
+            write_json(self.run / 'bpf-check-failure.json', current)
         require(not project_objects(current), 'Project BPF objects remain')
         return dict(sched_ext=state(), inventory=current, last=self.last)
 
@@ -192,6 +204,7 @@ class Helper:
         with self.listener.accept()[0] as peer:
             peer.settimeout(3)
             _, uid, _ = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            previous_child = self.child
             try:
                 require(uid == 1000, 'Only UID 1000 may use this helper')
                 packet = peer.recv(4097)
@@ -214,7 +227,15 @@ class Helper:
                     self.finished = True
                 peer.sendall(canonical(dict(ok=True, result=result)))
             except Exception as error:
-                peer.sendall(canonical(dict(ok=False, error=str(error))))
+                if 'op' in locals() and op == 'START' and self.child and self.child is not previous_child:
+                    try:
+                        self.stop(self.child['visit'], emergency=True)
+                    except Exception as cleanup:
+                        write_json(self.run / 'loader-start-cleanup-error.json', dict(error=str(cleanup)))
+                try:
+                    peer.sendall(canonical(dict(ok=False, error=str(error))))
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
     def close(self):
         if self.child:

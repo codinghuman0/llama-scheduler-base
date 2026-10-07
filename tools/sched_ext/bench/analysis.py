@@ -51,7 +51,7 @@ def summarize(rows):
                                    paired_block_slowdowns=[slowdown(table[b, reference][metric], table[b, candidate][metric], metric) for b in range(1, 11)])
         worst = max(m['slowdown_pct'] for m in metrics.values())
         gate = 'acceptable' if worst <= 0.5 else 'repeat_variance_investigation' if worst <= 1 else 'mandatory_overhead_investigation'
-        if any(m['precision_inconclusive'] for m in metrics.values()):
+        if worst <= 1 and any(m['precision_inconclusive'] for m in metrics.values()):
             gate = 'precision_inconclusive'
         if reference == 'A':
             gate = 'reference_only'

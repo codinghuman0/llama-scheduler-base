@@ -52,7 +52,9 @@ def change_status(run, status, **extra):
 
 def require_status(run, expected):
     manifest = read_json(run / 'manifest.json')
-    require(manifest['status'] in expected, f"Phase not allowed in state {manifest['status']}")
+    hint = (' No campaign has completed. Phase D must run only after Phase C prints CAMPAIGN_COMPLETE.'
+            if expected == {'CAMPAIGN_COMPLETE'} else '')
+    require(manifest['status'] in expected, f"Phase not allowed in state {manifest['status']}." + hint)
     require(manifest['helper_sources'] == sources(), 'Campaign automation changed after preparation')
     require(manifest['protocol'] == protocol_identity(), 'Protocol changed after preparation')
     require(manifest['head'] == repo_check(), 'Campaign repository revision changed')
@@ -84,6 +86,12 @@ def toolchain():
     require('13.3.0' in versions['cc'].splitlines()[0] and '13.3.0' in versions['c++'].splitlines()[0], 'GNU 13.3 compiler required')
     require('3.28.3' in versions['cmake'].splitlines()[0] and '4.3' in versions['make'].splitlines()[0], 'CMake/Make version differs')
     return dict(versions=versions, compiler_hashes={p: sha(p) for p in ('/usr/bin/cc', '/usr/bin/c++')})
+
+
+def toolchain_identity(tools):
+    # Translated license text is not a build identity.
+    return dict(compiler_hashes=tools['compiler_hashes'],
+                versions={name: text.splitlines()[0] for name, text in tools['versions'].items()})
 
 
 def validate_entry_points():
@@ -202,7 +210,43 @@ def validate_artifacts(run, *, model=False, offline=False):
     return artifacts
 
 
-def prepare():
+def reuse_bundles(run, previous, tools):
+    old = read_json(previous / 'manifest.json')
+    require(old['status'] in {'FAILED', 'FINALIZED'}, 'Only closed campaigns may provide reusable bundles')
+    require(toolchain_identity(old['toolchain']) == toolchain_identity(tools) and old['tags'] == TAGS and old['topology'] == topology()
+            and old['protocol'] == protocol_identity(), 'Reusable build/toolchain/protocol identity differs')
+    artifacts = validate_artifacts(previous)
+    for cfg in 'ABC':
+        record = artifacts[cfg]
+        expected = 'absent' if cfg == 'A' else 'ON' if cfg == 'C' else 'OFF'
+        require(record['hint'] == expected and record['trace'] == ('absent' if cfg == 'A' else 'OFF'), 'Reusable hint/TRACE configuration differs')
+        options = CMAKE_OPTIONS + ([] if cfg == 'A' else ['-DLLAMA_SCX_PHASE_HINT=' + expected, '-DLLAMA_SCX_PHASE_TRACE=OFF'])
+        require(record['configure_argv'][5:] == options, 'Reusable configure command differs')
+        for option in options:
+            if option.startswith('-D'):
+                key, value = option[2:].split('=', 1)
+                require(record['cache_subset'].get(key) == value and option in record['configure_argv'], 'Reusable build option differs: ' + key)
+        require(record['cache_subset'].get('CMAKE_CXX_FLAGS_RELEASE') == '-O3 -DNDEBUG', 'Reusable Release flags differ')
+        # Runtime bytes are immutable. Hardlinks avoid another full bundle copy.
+        shutil.copytree(previous / 'artifacts' / cfg, run / 'artifacts' / cfg, symlinks=True, copy_function=os.link)
+        shutil.copytree(previous / 'builds' / cfg, run / 'builds' / cfg)
+        for name, digest in record['files'].items():
+            require(sha(run / 'artifacts' / cfg / name) == digest, 'Reused runtime bytes differ')
+        require(read_json(run / 'builds' / cfg / 'identity.json') == record, 'Saved build metadata differs')
+        bundle = run / 'artifacts' / cfg
+        env = bundle_env(bundle)
+        ldd, libraries = dependencies(bundle / 'bin/llama-server', env)
+        require(all(p.is_relative_to(bundle) for p in libraries if p.name.startswith(('libllama', 'libggml', 'libmtmd'))),
+                'Reused bundle resolves a project library outside the new bundle')
+        version = audit_command(run, ['/usr/bin/taskset', '-c', '0,2,4,6,8', bundle / 'bin/llama-server', '--version'], env=env)
+        require(version == record['version'], 'Reused server version differs')
+        write_json(run / 'builds' / cfg / 'reuse-validation.json', dict(bundle_ldd=ldd, version=version))
+    write_json(run / 'artifacts.json', artifacts)
+    write_json(run / 'reused-artifacts.json', dict(source=str(previous), source_head=old['head'], files={cfg: artifacts[cfg]['files'] for cfg in 'ABC'}))
+    return artifacts
+
+
+def prepare(*, reuse_artifacts=False):
     head = repo_check()
     scheduler_check()
     require(state() == 'disabled' and not live_project_processes(), 'Project runtime is active')
@@ -213,9 +257,12 @@ def prepare():
     require_no_helper()
     RESULTS.mkdir(parents=True, exist_ok=True)
     pointer = RESULTS / '.active-run'
+    previous_run = None
     if pointer.exists():
-        previous = read_json(active_run() / 'manifest.json')
+        previous_run = active_run()
+        previous = read_json(previous_run / 'manifest.json')
         require(previous['status'] in {'FAILED', 'FINALIZED'}, 'Previous campaign must be finalized or explicitly failed first')
+    require(not reuse_artifacts or previous_run is not None, 'No previous campaign bundles to reuse')
     name = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     run = RESULTS / name
     suffix = 0
@@ -242,7 +289,8 @@ def prepare():
     write_json(run / 'manifest.json', manifest)
     try:
         with locked(run):
-            artifacts = {cfg: build_bundle(run, cfg) for cfg in 'ABC'}
+            artifacts = (reuse_bundles(run, previous_run, tools) if reuse_artifacts else
+                         {cfg: build_bundle(run, cfg) for cfg in 'ABC'})
             baseline_cache = artifacts['A']['cache_subset']
             for cfg in 'BC':
                 for option in CMAKE_OPTIONS:
@@ -292,7 +340,10 @@ def arm():
             change_status(run, 'FAILED', error=str(error))
             raise
     print('Preparation complete. Do not start the benchmark while Firefox/Codex are open.\n'
-          'Close Firefox, Codex and unnecessary GUI applications. Keep one terminal or TTY.\n'
+          'Close Firefox, all Codex UI/CLI sessions and unnecessary GUI applications. Keep one terminal or TTY.\n'
+          'Codex managed daemons can remain after closing its window. From that terminal run:\n'
+          './tools/sched_ext/bench/step10_phase_c_campaign.sh --stop-codex-daemons\n'
+          './tools/sched_ext/bench/step10_phase_c_campaign.sh --check-ready\n'
           'Then run: ./tools/sched_ext/bench/step10_phase_c_campaign.sh')
 
 
@@ -383,6 +434,25 @@ def stop_process(process, saved):
     return process.wait()
 
 
+def registered_child(path, launcher, bundle):
+    output = (path / 'server.stdout.log').read_text(errors='replace')
+    match = re.search(r'phase_uprobe_registered_tgid=(\d+)', output)
+    acknowledged = match is not None
+    if not match:
+        match = re.search(r'child_pid=(\d+)', output)
+    if not match:
+        return None, False
+    server = identity(int(match.group(1)))
+    executable = Path(f"/proc/{server['pid']}/exe").resolve()
+    if not acknowledged and executable == SCHED / 'bin/llama_scx_child':
+        return None, False
+    require(server['ppid'] == launcher['pid'] and server['uids'] == [1000] * 4
+            and executable == bundle / 'bin/llama-server', 'D child identity differs')
+    log = path / 'loader.log'
+    loader_output = log.read_text(errors='replace') if log.exists() else ''
+    return server, acknowledged and f"registered tgid={server['pid']} uid=1000" in loader_output
+
+
 def visit(run, plan, baseline, prompt_count):
     config, number = plan['config'], plan['visit']
     path = run / 'raw' / f'{number:02d}-{config}'
@@ -413,20 +483,19 @@ def visit(run, plan, baseline, prompt_count):
         if config == 'D':
             launcher = parent
             deadline = time.monotonic() + 30
+            accepted = False
             while time.monotonic() < deadline:
                 require(process.poll() is None, 'D launcher exited during registration')
-                output = (path / 'server.stdout.log').read_text(errors='replace')
-                match = re.search(r'phase_uprobe_registered_tgid=(\d+)', output)
-                if match:
-                    server = identity(int(match.group(1)))
-                    require(server['ppid'] == launcher['pid'], 'D child parent differs')
-                    loader_output = (path / 'loader.log').read_text(errors='replace')
-                    require(f"registered tgid={server['pid']} uid=1000" in loader_output, 'Root loader registration evidence absent')
+                candidate, accepted = registered_child(path, launcher, bundle)
+                if candidate:
+                    server = candidate
+                    write_json(path / 'processes.json', dict(server=server, launcher=launcher, loader=loader))
+                if accepted:
                     # Child inherits server affinity; move only its parent after ACK.
                     os.sched_setaffinity(launcher['pid'], {11})
                     break
                 time.sleep(0.05)
-            require(server is not None, 'D registration deadline exceeded')
+            require(server is not None and accepted, 'D registration deadline exceeded; see server and loader logs')
         else:
             server = parent
         write_json(path / 'processes.json', dict(server=server, launcher=launcher, loader=loader))
@@ -472,18 +541,37 @@ def visit(run, plan, baseline, prompt_count):
                                            prompt_n=prompt_count, measured_client=client, timings=measured['timings']))
         return prompt_count
     except BaseException as error:
-        write_json(path / 'visit.json', dict(**plan, status='INVALID', error=str(error), request_sha256=REQUEST_SHA))
+        errors = []
         try:
-            if root_started:
-                cleanup['root'] = helper_request(run, 'STOP', visit=number)
-            if process:
-                if server and launcher and same_process(server):
-                    signal_exact(server, signal.SIGTERM)
-                cleanup['server_launcher_exit'] = (stop_process(process, launcher or server or identity(process.pid))
-                                                   if process.poll() is None else process.wait())
-            cleanup.update(status='EMERGENCY', sched_ext=state())
+            write_json(path / 'visit.json', dict(**plan, status='INVALID', error=str(error), request_sha256=REQUEST_SHA))
         except Exception as failure:
-            cleanup.update(status='FAILED', error=str(failure))
+            errors.append('saving visit failure: ' + str(failure))
+        if root_started:
+            try:
+                cleanup['root'] = helper_request(run, 'STOP', visit=number)
+            except Exception as failure:
+                errors.append('loader cleanup: ' + str(failure))
+        try:
+            if process:
+                if launcher:
+                    if server and same_process(server):
+                        signal_exact(server, signal.SIGTERM)
+                    try:
+                        cleanup['server_launcher_exit'] = process.wait(timeout=20)
+                    except subprocess.TimeoutExpired:
+                        if server and same_process(server):
+                            signal_exact(server, signal.SIGKILL)
+                            cleanup['server_launcher_exit'] = process.wait(timeout=10)
+                        raise RuntimeError('Launcher cleanup required emergency recovery; see processes.json')
+                else:
+                    cleanup['server_launcher_exit'] = (stop_process(process, server or identity(process.pid))
+                                                       if process.poll() is None else process.wait())
+            require(not live_project_processes() and state() == 'disabled', 'Project runtime survived emergency cleanup')
+        except Exception as failure:
+            errors.append('server/launcher cleanup: ' + str(failure))
+        cleanup.update(status='FAILED' if errors else 'EMERGENCY', sched_ext=state())
+        if errors:
+            cleanup['errors'] = errors
         write_json(path / 'cleanup.json', cleanup)
         raise
     finally:
@@ -495,10 +583,10 @@ def campaign():
     run = active_run()
     with locked(run):
         manifest = require_status(run, {'ARMED'})
+        machine.reject_interactive_apps()
         validate_artifacts(run, model=True)
         require(os.sched_getaffinity(0) == {11} and os.sched_getscheduler(0) == 0, 'Campaign runner must be normal on CPU 11')
         require(not live_project_processes() and state() == 'disabled', 'Runtime already active')
-        machine.reject_interactive_apps()
         hello = helper_request(run, 'HELLO')
         require(hello['helper']['policy'] == 0 and hello['helper']['affinity'] == [10], 'Helper left the housekeeping core/normal policy')
         baseline = read_json(run / 'machine.json')['before']
@@ -506,6 +594,7 @@ def campaign():
         require(sha('/sys/kernel/btf/vmlinux') == manifest['btf_sha256'], 'Host BTF changed')
         change_status(run, 'RUNNING')
         prompt_count = None
+        plan = None
         try:
             for plan in order():
                 if plan['position'] == 1:
@@ -530,14 +619,24 @@ def campaign():
             (run / 'CAMPAIGN_COMPLETE').write_text('All 40 visits and cleanup gates passed.\n')
         except BaseException as error:
             try:
-                result = helper_request(run, 'ABORT')
-                write_json(run / 'abort-cleanup.json', result)
-                wait_gone(read_json(run / 'armed.json')['helper'])
+                helper = read_json(run / 'armed.json')['helper']
+                if same_process(helper):
+                    result = helper_request(run, 'ABORT')
+                    write_json(run / 'abort-cleanup.json', result)
+                    wait_gone(helper)
             except Exception as cleanup:
                 write_json(run / 'abort-cleanup-error.json', dict(error=str(cleanup)))
-            change_status(run, 'FAILED', error=str(error), invalid_block=plan['block'])
+            change_status(run, 'FAILED', error=str(error), invalid_block=plan['block'] if plan else None)
             raise
     print('CAMPAIGN_COMPLETE. Firefox/Codex may now be reopened.\nNext: ./tools/sched_ext/bench/step10_phase_d_finalize.sh')
+
+
+def check_ready():
+    machine.reject_interactive_apps()
+    require(not live_project_processes() and state() == 'disabled', 'Project runtime already active')
+    port_free()
+    machine.validate(machine.snapshot())
+    print('Quiet-application/port/power/topology checks passed. No request issued. Phase C still checks load/temperature before timing.')
 
 
 def collect_rows(run):
@@ -547,6 +646,10 @@ def collect_rows(run):
     visits = sorted((run / 'raw').iterdir())
     require(len(visits) == 40 and [p.name for p in visits] == [f"{p['visit']:02d}-{p['config']}" for p in order()], 'Visit directory count/order differs')
     for path, plan in zip(visits, order()):
+        baseline = read_json(run / 'machine.json')['before']
+        if plan['position'] == 1:
+            machine.validate_readiness(read_json(run / f"block-{plan['block']:02d}-idle.json"), baseline, after_warmup=False)
+        machine.validate_readiness(read_json(path / 'readiness.json'), baseline, after_warmup=True)
         value = read_json(path / 'visit.json')
         require(all(value[k] == v for k, v in plan.items()) and value['status'] == 'VALID', 'Invalid or misordered visit')
         artifact = read_json(run / 'artifacts.json')['C' if plan['config'] == 'D' else plan['config']]
@@ -612,33 +715,56 @@ def finalize():
     print(f'Phase D complete: {run / "final-report.md"}')
 
 
-def dry_run(phase):
+def dry_run(phase, *, reuse_artifacts=False, quiet_mode=None):
     # No campaign state, binaries, network requests, privilege or builds are used.
+    actions = {'prepare': ['verify', 'sequential A/B/C server-only builds', 'extract/validate --version', 'remove owned temporary builds'],
+               'arm': ['validate artifacts', 'snapshot machine', 'one sudo helper start; no sched_ext activation'],
+               'campaign': ['reject Firefox/Codex', '40 interleaved fresh-server visits; 2 warmups + 1 measurement each', 'cleanup and helper exit'],
+               'finalize': ['validate saved evidence', 'descriptive statistics', '10000 paired-block bootstrap draws']}
+    if reuse_artifacts:
+        actions['prepare'] = ['verify', 'validate/share previous A/B/C bundles; --version only; no builds']
+    if quiet_mode == 'check-ready':
+        actions['campaign'] = ['read-only application/port/power checks; no requests']
+    elif quiet_mode == 'stop-codex-daemons':
+        actions['campaign'] = ['verify managed daemon identities and closed UI/CLI', 'SIGTERM only those UID-1000 daemons; no requests']
     print(json.dumps(dict(phase=phase, dry_run=True, repository=str(REPO), results=str(RESULTS),
                           pointer=str(RESULTS / '.active-run'), server_cpus=sorted(SERVER_CPUS), runner_client_cpu=11,
                           helper_loader_cpu=10, compute_threads=5, batch_threads=5, order=order(),
                           prompt_sha256=PROMPT_SHA, request_sha256=REQUEST_SHA, revisions=REVISIONS,
-                          d_reuses='C', only_measurement_phase='campaign',
-                          actions={'prepare': ['verify', 'sequential A/B/C server-only builds', 'extract/validate --version', 'remove owned temporary builds'],
-                                   'arm': ['validate artifacts', 'snapshot machine', 'one sudo helper start; no sched_ext activation'],
-                                   'campaign': ['reject Firefox/Codex', '40 interleaved fresh-server visits; 2 warmups + 1 measurement each', 'cleanup and helper exit'],
-                                   'finalize': ['validate saved evidence', 'descriptive statistics', '10000 paired-block bootstrap draws']}[phase]), indent=2))
+                          d_reuses='C', only_measurement_phase='campaign', actions=actions[phase]), indent=2))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('phase', choices=('prepare', 'arm', 'campaign', 'finalize'))
     parser.add_argument('--dry-run', action='store_true', help='Print the immutable plan; perform no operations')
+    parser.add_argument('--reuse-artifacts', action='store_true', help='Phase A only: validate and reuse previous closed campaign bundles in a new campaign')
+    quiet_options = parser.add_mutually_exclusive_group()
+    quiet_options.add_argument('--check-ready', action='store_true', help='Phase C only: read-only application/port/power checks; do not start the campaign')
+    quiet_options.add_argument('--stop-codex-daemons', action='store_true', help='Phase C only: after closing UI/CLI, stop only your verified managed Codex daemons; no campaign requests')
     args = parser.parse_args()
     require(os.getuid() == 1000, 'Run phase entry points as codinghuman UID 1000, without sudo')
+    require(not args.reuse_artifacts or args.phase == 'prepare', '--reuse-artifacts is only for Phase A')
+    require(not (args.check_ready or args.stop_codex_daemons) or args.phase == 'campaign', 'Quiet checks are only for Phase C')
     if args.dry_run:
-        dry_run(args.phase)
+        dry_run(args.phase, reuse_artifacts=args.reuse_artifacts,
+                quiet_mode='check-ready' if args.check_ready else 'stop-codex-daemons' if args.stop_codex_daemons else None)
+        return
+    if args.stop_codex_daemons:
+        stopped = machine.stop_codex_daemons()
+        print('Managed Codex daemons stopped: ' + ', '.join(str(p['pid']) for p in stopped) + '. No campaign request issued.')
+        return
+    if args.check_ready:
+        check_ready()
         return
     def interrupted(signum, _frame):
         raise RuntimeError(f'Phase interrupted by signal {signum}')
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, interrupted)
-    globals()[args.phase]()
+    if args.phase == 'prepare':
+        prepare(reuse_artifacts=args.reuse_artifacts)
+    else:
+        globals()[args.phase]()
 
 
 if __name__ == '__main__':

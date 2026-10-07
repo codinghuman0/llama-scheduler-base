@@ -2,14 +2,16 @@
 """Synthetic and non-workload checks; never load BPF or send HTTP."""
 import hashlib
 import json
+from contextlib import ExitStack
 import os
 from pathlib import Path
 import signal
+import socket
 import shutil
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import analysis
 import common
@@ -25,6 +27,304 @@ def response():
 
 
 class CampaignTests(unittest.TestCase):
+    def test_port_check_rejects_a_live_listener(self):
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(('127.0.0.1', 0))
+            listener.listen(1)
+            with patch.object(common, 'PORT', listener.getsockname()[1]):
+                with self.assertRaises(OSError):
+                    common.port_free()
+
+    def test_port_check_accepts_closed_connections_in_time_wait(self):
+        with socket.socket() as listener, socket.socket() as client:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(('127.0.0.1', 0))
+            address = listener.getsockname()
+            listener.listen(1)
+            client.settimeout(2)
+            client.connect(address)
+            accepted, _ = listener.accept()
+            accepted.close()
+            self.assertEqual(client.recv(1), b'')
+        # The old plain bind must fail, proving this fixture exercises TIME_WAIT.
+        with socket.socket() as old_probe:
+            with self.assertRaises(OSError):
+                old_probe.bind(address)
+        with patch.object(common, 'PORT', address[1]):
+            common.port_free()
+
+    def test_codex_gate_does_not_exempt_managed_daemons(self):
+        daemon = str(Path.home() / '.codex/packages/app-server-daemon/releases/fixture/bin/codex')
+        argv = [daemon, 'app-server', '--listen', 'unix://', '--managed-daemon']
+        self.assertTrue(machine.managed_codex_daemon(argv))
+        for other in ([daemon], ['/usr/bin/codex', *argv[1:]], [daemon, *argv[1:], '--extra'], ['/bin/sleep', '30']):
+            self.assertFalse(machine.managed_codex_daemon(other))
+        with patch.object(machine, 'command', return_value='123 codex 0.0 ' + ' '.join(argv)):
+            with self.assertRaisesRegex(RuntimeError, 'stop-codex-daemons'):
+                machine.reject_interactive_apps()
+
+    def test_daemon_shutdown_refuses_an_active_cli_before_any_signal(self):
+        with patch.object(machine, 'interactive_apps', return_value=([], ['123 codex 0.0 /usr/bin/codex'])), \
+             patch.object(Path, 'read_bytes', return_value=b'/usr/bin/codex\0'), \
+             patch.object(machine, 'identity', return_value=dict(pid=123, uids=[1000]*4)), \
+             patch.object(machine, 'signal_exact') as send:
+            with self.assertRaisesRegex(RuntimeError, 'Exit interactive'):
+                machine.stop_codex_daemons()
+            send.assert_not_called()
+
+    def test_daemon_shutdown_uses_only_verified_identity_and_sigterm(self):
+        daemon = str(Path.home() / '.codex/packages/app-server-daemon/releases/fixture/bin/codex')
+        argv = [daemon, 'app-server', '--listen', 'unix://', '--managed-daemon']
+        saved = dict(pid=123, starttime='fixture', uids=[1000]*4)
+        alive = [True]
+        with patch.object(machine, 'interactive_apps', return_value=([], ['123 codex 0.0 ' + ' '.join(argv)])), \
+             patch.object(Path, 'read_bytes', return_value=('\0'.join(argv)+'\0').encode()), \
+             patch.object(machine, 'identity', return_value=saved), \
+             patch.object(machine, 'same_process', side_effect=lambda _: alive[0]), \
+             patch.object(machine, 'reject_interactive_apps'), \
+             patch.object(machine, 'signal_exact', side_effect=lambda *_: alive.__setitem__(0, False)) as send:
+            self.assertEqual(machine.stop_codex_daemons(), [saved])
+            send.assert_called_once_with(saved, signal.SIGTERM)
+
+    def test_registration_waits_for_asynchronously_written_loader_log(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            bundle = path / 'bundle'
+            server = dict(pid=123, ppid=122, uids=[1000]*4)
+            (path / 'server.stdout.log').write_text('phase_uprobe_registered_tgid=123\n')
+            original_resolve = Path.resolve
+            def resolve(value, *args, **kwargs):
+                return bundle / 'bin/llama-server' if str(value) == '/proc/123/exe' else original_resolve(value, *args, **kwargs)
+            with patch.object(step10, 'identity', return_value=server), patch.object(Path, 'resolve', resolve):
+                self.assertEqual(step10.registered_child(path, dict(pid=122), bundle), (server, False))
+                (path / 'loader.log').write_text('llama_scx: registered tgid=123 uid=1000\n')
+                self.assertEqual(step10.registered_child(path, dict(pid=122), bundle), (server, True))
+
+    def test_failed_loader_start_is_rolled_back_before_error_response(self):
+        helper = root_helper.Helper.__new__(root_helper.Helper)
+        helper.child, helper.token = None, 'fixture'
+        for existing in (False, True):
+            server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            try:
+                helper.child = dict(visit=4) if existing else None
+                helper.listener = Mock()
+                helper.listener.accept.return_value = (server, None)
+                def failing_start(_visit):
+                    if not existing:
+                        helper.child = dict(visit=4)
+                    raise RuntimeError('synthetic startup failure')
+                helper.start = Mock(side_effect=failing_start)
+                helper.stop = Mock(side_effect=lambda *_args, **_kwargs: setattr(helper, 'child', None))
+                client.sendall(common.canonical(dict(op='START', token='fixture', visit=4)))
+                helper.handle_peer()
+                result = json.loads(client.recv(4096))
+                self.assertFalse(result['ok'])
+                if existing:
+                    helper.stop.assert_not_called()
+                else:
+                    helper.stop.assert_called_once_with(4, emergency=True)
+            finally:
+                server.close()
+                client.close()
+
+    def test_loader_identity_failure_reaps_our_direct_child(self):
+        process = subprocess.Popen(['/usr/bin/sleep','30'], stderr=subprocess.PIPE)
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                run = Path(temp)
+                (run/'artifacts/C/bin').mkdir(parents=True)
+                (run/'artifacts/C/bin/llama-server').write_text('fixture')
+                (run/'raw/04-D').mkdir(parents=True)
+                helper = root_helper.Helper.__new__(root_helper.Helper)
+                helper.run, helper.child, helper.last = run, None, None
+                helper.c_artifact = dict(files={'bin/llama-server':'fixture'})
+                with patch.object(root_helper,'state',return_value='disabled'), patch.object(root_helper,'scheduler_check'), \
+                     patch.object(root_helper,'sha',return_value='fixture'), patch.object(root_helper.subprocess,'Popen',return_value=process), \
+                     patch.object(root_helper,'identity',side_effect=RuntimeError('synthetic identity failure')):
+                    with self.assertRaisesRegex(RuntimeError,'synthetic identity failure'):
+                        helper.start(4)
+                self.assertIsNotNone(process.poll())
+                self.assertTrue((run/'raw/04-D/loader.log').exists())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stderr.close()
+
+    def simulate_campaign(self, run, *, fail_visit=None, fail_order=False, blocked=False):
+        common.write_json(run / 'manifest.json', dict(status='ARMED', head='fixture', btf_sha256='fixture'))
+        common.write_json(run / 'machine.json', dict(before={}))
+        common.write_json(run / 'armed.json', dict(helper={}))
+        visits, operations, alive = [], [], [True]
+        def helper(_run, operation):
+            operations.append(operation)
+            if operation in {'FINISH', 'ABORT'}:
+                alive[0] = False
+            return dict(helper=dict(policy=0, affinity=[10]))
+        def visit(_run, plan, _baseline, _count):
+            visits.append(plan['visit'])
+            if plan['visit'] == fail_visit:
+                raise RuntimeError('synthetic visit failure')
+            return 900
+        with ExitStack() as stack:
+            for name, value in dict(active_run=lambda: run, require_status=lambda *_: common.read_json(run/'manifest.json'),
+                                    validate_artifacts=lambda *_a, **_k: None, live_project_processes=lambda: [], state=lambda: 'disabled',
+                                    helper_request=helper, visit=visit, sha=lambda _: 'fixture', repo_check=lambda: 'fixture',
+                                    model_identity=lambda: {}, port_free=lambda: None, wait_gone=lambda _: None,
+                                    same_process=lambda _: alive[0]).items():
+                stack.enter_context(patch.object(step10, name, value))
+            stack.enter_context(patch.object(step10.os, 'sched_getaffinity', return_value={11}))
+            stack.enter_context(patch.object(step10.os, 'sched_getscheduler', return_value=0))
+            stack.enter_context(patch.object(machine, 'snapshot', return_value={}))
+            stack.enter_context(patch.object(machine, 'validate'))
+            stack.enter_context(patch.object(machine, 'readiness'))
+            stack.enter_context(patch.object(machine, 'reject_interactive_apps', side_effect=RuntimeError('synthetic app blocker') if blocked else None, return_value=[]))
+            if fail_order:
+                stack.enter_context(patch.object(step10, 'order', side_effect=RuntimeError('synthetic order failure')))
+            if blocked or fail_visit or fail_order:
+                with self.assertRaisesRegex(RuntimeError, 'synthetic'):
+                    step10.campaign()
+            else:
+                step10.campaign()
+        return visits, operations
+
+    def test_all_40_campaign_visits_and_final_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp)
+            visits, operations = self.simulate_campaign(run)
+            self.assertEqual(visits, list(range(1, 41)))
+            self.assertEqual(operations, ['HELLO', 'FINISH'])
+            self.assertEqual(common.read_json(run/'manifest.json')['status'], 'CAMPAIGN_COMPLETE')
+            self.assertTrue((run/'CAMPAIGN_COMPLETE').exists())
+
+    def test_campaign_failure_aborts_without_replacing_sample(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp)
+            visits, operations = self.simulate_campaign(run, fail_visit=4)
+            self.assertEqual(visits, [1, 2, 3, 4])
+            self.assertEqual(operations, ['HELLO', 'ABORT'])
+            self.assertEqual(common.read_json(run/'manifest.json')['status'], 'FAILED')
+            self.assertFalse((run/'CAMPAIGN_COMPLETE').exists())
+
+    def test_failure_before_first_visit_preserves_original_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp)
+            self.simulate_campaign(run, fail_order=True)
+            value = common.read_json(run/'manifest.json')
+            self.assertEqual(value['error'], 'synthetic order failure')
+            self.assertIsNone(value['invalid_block'])
+
+    def test_app_refusal_before_requests_leaves_campaign_armed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp)
+            visits, operations = self.simulate_campaign(run, blocked=True)
+            self.assertEqual((visits, operations), ([], []))
+            self.assertEqual(common.read_json(run/'manifest.json')['status'], 'ARMED')
+
+    def test_arming_handshake_failure_disarms_helper_and_records_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = Path(temp)
+            common.write_json(run/'manifest.json', dict(status='PREPARED', kernel='fixture', boot_id='fixture', btf_sha256='fixture'))
+            ready = dict(helper=dict(uid=0, policy=0, affinity=[10]))
+            calls = []
+            def request(_run, op):
+                calls.append(op)
+                if op == 'CHECK':
+                    raise RuntimeError('synthetic handshake failure')
+                return {}
+            with patch.object(step10, 'active_run', return_value=run), \
+                 patch.object(step10, 'require_status', side_effect=lambda *_: common.read_json(run/'manifest.json')), \
+                 patch.object(step10, 'validate_artifacts'), patch.object(step10, 'state', return_value='disabled'), \
+                 patch.object(step10, 'live_project_processes', return_value=[]), patch.object(step10, 'require_no_helper'), \
+                 patch.object(step10, 'port_free'), patch.object(machine, 'snapshot', return_value=dict(kernel='fixture', boot_id='fixture')), \
+                 patch.object(machine, 'validate'), patch.object(step10, 'sha', return_value='fixture'), \
+                 patch.object(step10, 'audit_command', return_value=json.dumps(ready)), \
+                 patch.object(step10, 'helper_request', side_effect=request), patch.object(step10, 'wait_gone') as gone:
+                with self.assertRaisesRegex(RuntimeError, 'handshake failure'):
+                    step10.arm()
+                self.assertEqual(calls, ['HELLO', 'CHECK', 'ABORT'])
+                gone.assert_called_once_with(ready['helper'])
+                self.assertEqual(common.read_json(run/'manifest.json')['status'], 'FAILED')
+
+    def test_visit_cleans_child_even_if_saving_failure_evidence_fails(self):
+        process = subprocess.Popen(['/usr/bin/sleep', '30'])
+        try:
+            saved = common.identity(process.pid)
+            with tempfile.TemporaryDirectory() as temp:
+                run = Path(temp)
+                (run/'raw').mkdir()
+                def save(path, value):
+                    if path.name=='visit.json' and value.get('status')=='INVALID':
+                        raise OSError('synthetic disk full')
+                    common.write_json(path, value)
+                with patch.object(step10.subprocess, 'Popen', return_value=process), \
+                     patch.object(step10, 'helper_request', return_value={}), patch.object(step10, 'port_free'), \
+                     patch.object(step10, 'health', side_effect=RuntimeError('synthetic startup error')), \
+                     patch.object(step10, 'live_project_processes', return_value=[]), patch.object(step10, 'state', return_value='disabled'), \
+                     patch.object(step10, 'write_json', side_effect=save):
+                    with self.assertRaisesRegex(RuntimeError, 'synthetic startup error'):
+                        step10.visit(run,common.order()[0],{},None)
+                self.assertIsNotNone(process.poll())
+                self.assertFalse(common.same_process(saved))
+                cleanup=common.read_json(run/'raw/01-A/cleanup.json')
+                self.assertEqual(cleanup['status'],'FAILED')
+                self.assertIn('disk full',cleanup['errors'][0])
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    def test_reuse_build_bundles_preserves_bytes_and_never_reuses_samples(self):
+        with tempfile.TemporaryDirectory() as temp:
+            previous, run = Path(temp)/'old', Path(temp)/'new'
+            previous.mkdir()
+            run.mkdir()
+            tools = dict(versions=dict(make='GNU Make 4.3\nOriginal localized license'), compiler_hashes={'cc':'fixture'})
+            current_tools = tools | dict(versions=dict(make='GNU Make 4.3\nDifferent localized license'))
+            common.write_json(previous/'manifest.json', dict(status='FAILED', head='fixture', toolchain=tools, tags=common.TAGS, topology={}, protocol={}))
+            artifacts = {}
+            for cfg in 'ABC':
+                bundle, metadata = previous/'artifacts'/cfg, previous/'builds'/cfg
+                (bundle/'bin').mkdir(parents=True)
+                metadata.mkdir(parents=True)
+                (bundle/'bin/llama-server').write_bytes(b'synthetic runtime')
+                hint = 'absent' if cfg=='A' else 'ON' if cfg=='C' else 'OFF'
+                options = step10.CMAKE_OPTIONS + ([] if cfg=='A' else ['-DLLAMA_SCX_PHASE_HINT='+hint, '-DLLAMA_SCX_PHASE_TRACE=OFF'])
+                cache = dict(option[2:].split('=', 1) for option in options if option.startswith('-D'))
+                cache['CMAKE_CXX_FLAGS_RELEASE'] = '-O3 -DNDEBUG'
+                record = dict(hint=hint, trace='absent' if cfg=='A' else 'OFF', cache_subset=cache, configure_argv=['cmake','-S','source','-B','build']+options,
+                              files={'bin/llama-server':common.sha(bundle/'bin/llama-server')}, version='fixture')
+                artifacts[cfg] = record
+                common.write_json(metadata/'identity.json', record)
+            (previous/'raw').mkdir()
+            (previous/'raw/failed-sample.json').write_text('must stay in old campaign')
+            with patch.object(step10, 'topology', return_value={}), patch.object(step10, 'protocol_identity', return_value={}), \
+                 patch.object(step10, 'validate_artifacts', return_value=artifacts), \
+                 patch.object(step10, 'dependencies', return_value=('synthetic dependency resolution', [])), \
+                 patch.object(step10, 'audit_command', return_value='fixture') as commands:
+                step10.reuse_bundles(run, previous, current_tools)
+                self.assertEqual(commands.call_count, 3)
+                self.assertTrue(all(c.args[1][-1]=='--version' for c in commands.call_args_list))
+                for cfg in 'ABC':
+                    old, new = previous/'artifacts'/cfg/'bin/llama-server', run/'artifacts'/cfg/'bin/llama-server'
+                    self.assertEqual((old.stat().st_ino, old.stat().st_dev), (new.stat().st_ino, new.stat().st_dev))
+                self.assertFalse((run/'raw').exists())
+                self.assertEqual((previous/'raw/failed-sample.json').read_text(), 'must stay in old campaign')
+                damaged = artifacts['B']['cache_subset']
+                damaged['GGML_CUDA'] = 'ON'
+                another = Path(temp)/'invalid'
+                another.mkdir()
+                with self.assertRaisesRegex(RuntimeError, 'build option differs'):
+                    step10.reuse_bundles(another, previous, current_tools)
+
+    def test_large_slowdown_gate_is_not_downgraded_by_wide_interval(self):
+        rows = [plan | dict(prefill_tps=100, decode_tps=20, request_wall_ms=1000*(1.1 if plan['config']=='D' else 1)) for plan in common.order()]
+        with patch.object(analysis, 'percentile', side_effect=lambda _values, fraction: 0 if fraction==0.025 else 2):
+            pair = analysis.summarize(rows)['pairs']['C->D']
+        self.assertTrue(pair['metrics']['request_wall_ms']['precision_inconclusive'])
+        self.assertEqual(pair['gate'], 'mandatory_overhead_investigation')
+
     def test_request_identity_and_order(self):
         self.assertEqual(len(common.PROMPT.encode()), 5023)
         self.assertEqual(hashlib.sha256(common.PROMPT.encode()).hexdigest(), common.PROMPT_SHA)
@@ -220,12 +520,16 @@ class CampaignTests(unittest.TestCase):
             common.write_json(run / 'visit-order.json', common.order())
             artifact = dict(files={'bin/llama-server':'synthetic'}, revision='synthetic')
             common.write_json(run / 'artifacts.json', {c: artifact for c in 'ABC'})
-            snapshot = dict(kernel='fixture',boot_id='fixture',topology={},boost='1',ac={'ADP0':'1'},tctl_c=40,
+            snapshot = dict(kernel='fixture',boot_id='fixture',topology={},boost='1',ac={'ADP0':'1'},tctl_c=40,loadavg=[0,0,0],
                             policies={'policy0':dict(scaling_driver='acpi-cpufreq',scaling_governor='schedutil')})
             common.write_json(run / 'machine.json', dict(before=snapshot))
+            ready = dict(first=snapshot, second=snapshot, third=snapshot, busy_pct=0, second_busy_pct=0, ready=True)
+            for block in range(1,11):
+                common.write_json(run / f'block-{block:02d}-idle.json', [ready])
             for plan in common.order():
                 path = run / 'raw' / f"{plan['visit']:02d}-{plan['config']}"
                 path.mkdir()
+                common.write_json(path / 'readiness.json', [ready])
                 common.write_json(path / 'visit.json', plan | dict(status='VALID',artifact_files=artifact['files'],request_sha256=common.REQUEST_SHA))
                 common.write_json(path / 'command.json', dict(revision='synthetic',affinity=sorted(common.SERVER_CPUS),compute_threads=5,batch_threads=5,http_threads=2))
                 common.write_json(path / 'cleanup.json', dict(status='PASS',server_launcher_exit=0,sched_ext='disabled',port_free=True,
@@ -243,6 +547,11 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(len(rows), 40)
             analysis.export(run, rows, analysis.summarize(rows))
             self.assertTrue((run / 'final-report.md').exists())
+            readiness = run / 'raw/01-A/readiness.json'
+            common.write_json(readiness, [ready | dict(busy_pct=20)])
+            with self.assertRaisesRegex(RuntimeError, 'CPU busy'):
+                step10.collect_rows(run)
+            common.write_json(readiness, [ready])
             damaged = run / 'raw/04-D/visit.json'
             common.write_json(damaged, common.read_json(damaged) | dict(status='INVALID'))
             with self.assertRaises(RuntimeError):
