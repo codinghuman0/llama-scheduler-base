@@ -3,6 +3,11 @@
  * Renamed baseline derived from Linux v6.17 tools/sched_ext/scx_simple.bpf.c.
  * Instrumentation below observes existing decisions only.  It never changes a
  * CPU choice, DSQ, queue order, vtime calculation, slice, or wake-up path.
+ *
+ * Copyright (c) 2022 Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2022 Tejun Heo <tj@kernel.org>
+ * Copyright (c) 2022 David Vernet <dvernet@meta.com>
+ * Author notices restored on 2026-10-08; no implementation change.
  */
 #define BPF_NO_KFUNC_PROTOTYPES
 #define LLAMA_BPF

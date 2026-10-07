@@ -5,6 +5,10 @@ llama.cpp project remains MIT-licensed. Files derived from Linux
 `sched_ext/scx_simple` and the scheduler component are GPL-2.0 and are
 intentionally kept inside this separately licensed subtree.
 
+## Licensing and provenance
+
+The full scheduler GPLv2 text is in [LICENSE](LICENSE). Linux-derived files retain their GPL-2.0 SPDX and original author notices; project scheduler/control, validation and benchmark tooling retain their existing GPL-2.0 terms. See the repository [licensing and provenance notice](../../THIRD_PARTY_NOTICES.md) for the component inventory, upstream sources and publication checklist. The external benchmark model and runtime bundles are not distributed; inherited vocabulary-only GGUF test fixtures are distinct from model weights. The validated Base checkpoint remains documented in [LIGHTWEIGHT_BASE_V1_CHECKPOINT.md](LIGHTWEIGHT_BASE_V1_CHECKPOINT.md).
+
 The privileged sched_ext loader will remain a separate executable from
 `llama-server`. `llama-server` must remain runnable as a normal user and must
 not link libbpf or privileged scheduler-loading functionality.

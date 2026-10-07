@@ -1,5 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Direct-libBPF loader for the scheduler and optional phase sources. */
+/*
+ * Direct-libBPF loader for the scheduler and optional phase sources.
+ * Lifecycle/statistics base derived from Linux v6.17 scx_simple.c.
+ *
+ * Copyright (c) 2022 Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2022 Tejun Heo <tj@kernel.org>
+ * Copyright (c) 2022 David Vernet <dvernet@meta.com>
+ * Author notices restored on 2026-10-08; no implementation change.
+ */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <getopt.h>
