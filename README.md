@@ -16,6 +16,168 @@
 
 </div>
 
+## 이 저장소에 대하여
+
+이 저장소는 CPU-only LLM inference 환경에서 Linux `sched_ext` 기반 스케줄링을 연구하기 위해 수정한 `llama.cpp` fork입니다.
+
+현재 `Lightweight Base v1`은 향후 phase-aware, load-aware, topology-aware scheduling policy를 실험하기 위한 **중립적인 baseline**입니다.
+
+현재 Base Version에서는 `llama.cpp`가 inference 실행 phase를 분류하여 scheduler 측으로 전달할 수 있지만, scheduler는 아직 이 phase 정보를 scheduling decision에 사용하지 않습니다.
+
+즉 현재 구조는 다음 단계의 정책 실험을 위한 기준점입니다.
+
+```text
+Lightweight Base v1
+        │
+        ├── Phase-aware policy
+        ├── Load-aware policy
+        ├── Topology-aware policy
+        └── Combined policies
+```
+
+### 프로젝트 구현 위치
+
+#### 1. Lightweight sched_ext scheduler
+
+실제로 사용되는 scheduler 구현은 [`tools/sched_ext/`](tools/sched_ext/) 아래에 있습니다.
+
+- [`tools/sched_ext/llama_scx.bpf.c`](tools/sched_ext/llama_scx.bpf.c)
+  - 실제 BPF `sched_ext` scheduling policy
+  - Linux `scx_simple`의 weighted-vtime scheduling을 기반으로 하는 neutral scheduler
+
+- [`tools/sched_ext/llama_scx.c`](tools/sched_ext/llama_scx.c)
+  - userspace scheduler loader
+  - 대상 `llama-server` 등록
+  - phase uprobe 연결
+  - scheduler lifecycle 및 cleanup 관리
+
+- [`tools/sched_ext/llama_scx_child.c`](tools/sched_ext/llama_scx_child.c)
+  - 선택된 `llama-server`와 해당 process가 생성한 thread를 `SCHED_EXT`에 진입시키기 위한 launcher
+
+- [`tools/sched_ext/include/`](tools/sched_ext/include/)
+  - userspace/BPF 사이의 scheduler state 및 control ABI 정의
+
+다음 디렉터리는 실제 performance scheduler와 구분하여 보존합니다.
+
+- [`tools/sched_ext/provenance/`](tools/sched_ext/provenance/)
+  - active scheduler 구현의 기준으로 사용한 Linux sched_ext 원본 소스
+
+- [`tools/sched_ext/validation/`](tools/sched_ext/validation/)
+  - 개발 과정에서 correctness 검증에 사용한 instrumentation-heavy scheduler
+  - 실제 성능 측정용 scheduler로는 사용하지 않음
+
+#### 2. llama.cpp phase-hint 경로
+
+`llama.cpp`에는 현재 inference가 어떤 phase에 있는지 판단하여 scheduler 측으로 전달하기 위한 lightweight phase-hint 경로가 추가되어 있습니다.
+
+개념적인 흐름은 다음과 같습니다.
+
+```text
+semantic batch 확인
+        ↓
+UNKNOWN / PREFILL / DECODE / MIXED 분류
+        ↓
+직전 phase와 비교
+        ↓
+phase가 변경되었는가?
+        ├── 아니오 → 기존 실행 계속
+        └── 예     → llama_scx_phase_v1(uint32_t) 호출
+```
+
+동일한 phase가 계속되는 동안에는 marker를 반복 호출하지 않고, **phase transition이 발생했을 때만** marker를 호출합니다.
+
+Lightweight configuration은 다음과 같습니다.
+
+```text
+LLAMA_SCX_PHASE_HINT=ON
+LLAMA_SCX_PHASE_TRACE=OFF
+```
+
+과거 correctness 검증에 사용했던 begin/end tracing 및 GGML worker tracing은 이 configuration에서는 활성화되지 않습니다.
+
+Phase-hint 동작을 이해하기 위해 우선 확인할 파일은 다음과 같습니다.
+
+- [`tools/server/server-phase.h`](tools/server/server-phase.h)
+  - server 측 phase 분류 관련 정의
+
+- [`tools/server/server-scx.h`](tools/server/server-scx.h)
+  - `llama_scx_phase_v1()` marker 및 SCX 연동
+
+- [`tools/server/server-context.cpp`](tools/server/server-context.cpp)
+  - 실제 server inference 경로와 phase classification을 연결하는 핵심 코드
+
+- [`src/llama-context.cpp`](src/llama-context.cpp)
+- [`src/llama-context.h`](src/llama-context.h)
+- [`include/llama.h`](include/llama.h)
+  - compute profile 및 llama decode 실행 경로를 지원하기 위한 llama-side 변경
+
+추가적인 configuration 및 compute-profile 관련 변경은 다음 파일에 포함되어 있습니다.
+
+- [`common/arg.cpp`](common/arg.cpp)
+- [`common/common.h`](common/common.h)
+- [`src/llama-kv-cache.cpp`](src/llama-kv-cache.cpp)
+- [`ggml/src/ggml-cpu/ggml-cpu.c`](ggml/src/ggml-cpu/ggml-cpu.c)
+- [`CMakeLists.txt`](CMakeLists.txt)
+- [`tools/server/CMakeLists.txt`](tools/server/CMakeLists.txt)
+
+테스트, benchmark 및 이전 검증 결과도 저장소에 포함되어 있지만, 위 파일들이 현재 runtime path를 이해하기 위한 주요 구현입니다.
+
+### Phase 정보 전달 구조
+
+scheduler 측 active control state는 다음 세 값만 유지합니다.
+
+```c
+uint32_t selected_tgid;
+uint32_t current_phase;
+uint32_t exit_kind;
+```
+
+선택된 `llama-server`에 PID-scoped uprobe 하나를 연결하여
+
+```text
+llama_scx_phase_v1(uint32_t phase)
+```
+
+호출을 관측하고 `current_phase`를 갱신합니다.
+
+현재 neutral Base의 scheduling callback은 `current_phase`를 읽거나 scheduling decision에 사용하지 않습니다.
+
+따라서 현재 버전의 목적은 **phase 전달 infrastructure 자체의 비용과 sched_ext baseline을 먼저 검증한 뒤, 이후 policy 효과를 독립적으로 비교할 수 있는 기준점을 만드는 것**입니다.
+
+### 검증 결과
+
+`Lightweight Base v1`은 다음 항목을 검증한 상태입니다.
+
+- 선택된 `llama-server` 및 해당 thread만 `SCHED_EXT`에서 실행
+- 다른 일반 process는 기존 Linux scheduler에 유지
+- PREFILL → DECODE phase 전달 확인
+- phase-hint transport의 성능 overhead 검증
+- neutral sched_ext baseline의 성능 검증
+- clean-clone 가능한 release checkpoint 생성
+
+Base Version의 최종 release tag:
+
+```text
+lightweight-base-v1-release
+```
+
+### 상세 문서
+
+보다 자세한 구조 및 검증 결과는 다음 문서를 참고하십시오.
+
+- [`tools/sched_ext/LIGHTWEIGHT_BASE_V1_CHECKPOINT.md`](tools/sched_ext/LIGHTWEIGHT_BASE_V1_CHECKPOINT.md)
+  - Base Version의 구조, revision, validation 및 성능 결과
+
+- [`tools/sched_ext/BENCHMARK_PROTOCOL.md`](tools/sched_ext/BENCHMARK_PROTOCOL.md)
+  - A/B/C/D benchmark 구성과 측정 방법
+
+- [`tools/sched_ext/README.md`](tools/sched_ext/README.md)
+  - sched_ext scheduler의 구조와 사용 방법
+
+---
+
+아래 내용은 upstream `llama.cpp`의 기본 사용법 및 프로젝트 문서입니다.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
