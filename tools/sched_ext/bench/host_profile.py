@@ -77,7 +77,12 @@ def capabilities(*, cpu=Path('/sys/devices/system/cpu'), hwmon_root=Path('/sys/c
 
 
 def execution_state(value):
-    return {k: value[k] for k in ('turbo', 'temperature_sensor', 'power_supply')} | {
+    power = value['power_supply']
+    entries = {name: {k: supply[k] for k in ('type', 'present', 'online')
+                      if k in supply and (k != 'online' or supply.get('type') != 'Battery')}
+               for name, supply in power['entries'].items()}
+    return {k: value[k] for k in ('turbo', 'temperature_sensor')} | {
+        'power_supply': dict(available=power['available'], entries=entries),
         'frequency': dict(available=value['frequency']['available'], policies={p: {k: v for k, v in fields.items() if k != 'scaling_cur_freq'}
                                                                            for p, fields in value['frequency']['policies'].items()})}
 

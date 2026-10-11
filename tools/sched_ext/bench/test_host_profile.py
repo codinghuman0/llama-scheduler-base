@@ -50,6 +50,37 @@ class HostProfileTests(unittest.TestCase):
             (ac / 'online').write_text('0')
             self.assertNotEqual(host_profile.execution_state(initial), host_profile.execution_state(host_profile.capabilities(**kwargs)))
 
+    def test_power_invariants_ignore_battery_status_and_preserve_supply_state(self):
+        value = dict(frequency=dict(available=False, policies={}), turbo=dict(available=False, interfaces={}),
+                     temperature_sensor='unavailable', power_supply=dict(available=True, entries={
+                         'adapter': dict(type='Mains', online='1', present='1'),
+                         'BAT0': dict(type='Battery', present='1', status='Charging')}))
+        initial = host_profile.execution_state(value)
+        full = copy.deepcopy(value)
+        full['power_supply']['entries']['BAT0']['status'] = 'Full'
+        self.assertEqual(host_profile.execution_state(full), initial)
+        for name, field, changed_value in (('adapter', 'online', '0'), ('adapter', 'type', 'USB'),
+                                           ('adapter', 'present', '0'), ('BAT0', 'type', 'UPS'), ('BAT0', 'present', '0')):
+            with self.subTest(supply=name, field=field):
+                changed = copy.deepcopy(value)
+                changed['power_supply']['entries'][name][field] = changed_value
+                self.assertNotEqual(host_profile.execution_state(changed), initial)
+        renamed = copy.deepcopy(value)
+        entries = renamed['power_supply']['entries']
+        entries['other_adapter'] = entries.pop('adapter')
+        self.assertNotEqual(host_profile.execution_state(renamed), initial)
+        unavailable = copy.deepcopy(value)
+        unavailable['power_supply']['available'] = False
+        self.assertNotEqual(host_profile.execution_state(unavailable), initial)
+        limited = copy.deepcopy(value)
+        limited['power_supply']['entries'] = {'adapter': dict(online='1')}
+        self.assertEqual(host_profile.execution_state(limited)['power_supply'],
+                         dict(available=True, entries={'adapter': dict(online='1')}))
+        limited['power_supply']['entries']['adapter']['online'] = '0'
+        self.assertNotEqual(host_profile.execution_state(limited)['power_supply'],
+                            dict(available=True, entries={'adapter': dict(online='1')}))
+        self.assertEqual(value['power_supply']['entries']['BAT0']['status'], 'Charging')
+
     def test_sensor_discovery_has_no_hwmon_index_or_vendor_requirement(self):
         for name, label in (('k10temp', 'Tctl'), ('coretemp', 'Package id 2')):
             with tempfile.TemporaryDirectory() as temp:

@@ -312,11 +312,7 @@ else
 fi
 
 say "Fresh lightweight sched_ext build"
-if ! if ! make -B -C "$REPO_ROOT/tools/sched_ext" -j"$BUILD_JOBS"; then
-    block "neutral scheduler build failed; check matching kernel UAPI headers and compiler/libbpf support"
-    printf 'CLEAN_ROOM_BUILD_RESULT=BLOCKED\n'
-    exit 2
-fi; then
+if ! make -B -C "$REPO_ROOT/tools/sched_ext" -j"$BUILD_JOBS"; then
     block "neutral scheduler build failed; check matching kernel UAPI headers and compiler/libbpf support"
     printf 'CLEAN_ROOM_BUILD_RESULT=BLOCKED\n'
     exit 2
