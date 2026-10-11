@@ -34,7 +34,7 @@ mkdir -p "$RUN_DIR"
 
 DEFAULT_PGID=""
 CHILD_PGID=""
-LOADER_PGID=""
+LOADER_PID=""
 
 say()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32mPASS\033[0m  %s\n' "$*"; }
@@ -48,19 +48,20 @@ kill_group_user() {
     kill -TERM -- "-$pgid" 2>/dev/null || true
 }
 
-kill_group_root() {
-    local pgid="${1:-}"
-    [[ -n "$pgid" ]] || return 0
-    sudo -n kill -INT -- "-$pgid" 2>/dev/null || true
+kill_root_process() {
+    local pid="${1:-}"
+    [[ -n "$pid" ]] || return 0
+    # sudo itself owns/monitors the privileged child and relays signals to it.
+    sudo -n kill -INT "$pid" 2>/dev/null || true
     sleep 0.2
-    sudo -n kill -TERM -- "-$pgid" 2>/dev/null || true
+    sudo -n kill -TERM "$pid" 2>/dev/null || true
 }
 
 cleanup() {
     set +e
     kill_group_user "$DEFAULT_PGID"
     kill_group_user "$CHILD_PGID"
-    kill_group_root "$LOADER_PGID"
+    kill_root_process "$LOADER_PID"
     wait 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -181,20 +182,21 @@ rm -f \
   "$RUN_DIR/sched-server.log" \
   "$RUN_DIR/phase-observer.log"
 
-# Start the root loader in a dedicated process group.
-setsid sudo -n "$SCHED" \
+# Start the privileged loader while sudo still sees the current controlling TTY.
+# Do not put `setsid` before sudo: Ubuntu sudo timestamps are commonly TTY-scoped.
+sudo -n "$SCHED" \
   --phase-uid "$(id -u)" \
   --phase-register-socket "$PHASE_SOCK" \
   --server-exe "$SERVER" \
   --marker-elf "$MARKER" \
   >"$RUN_DIR/sched-loader.log" 2>&1 &
-LOADER_PGID=$!
+LOADER_PID=$!
 
 # Wait for struct_ops attachment.
 for _ in $(seq 1 100); do
     state="$(cat /sys/kernel/sched_ext/state 2>/dev/null || true)"
     [[ "$state" == "enabled" ]] && break
-    if ! kill -0 "$LOADER_PGID" 2>/dev/null; then
+    if ! kill -0 "$LOADER_PID" 2>/dev/null; then
         cat "$RUN_DIR/sched-loader.log" >&2 || true
         die "scheduler loader exited before sched_ext became enabled"
     fi
@@ -406,17 +408,17 @@ CHILD_PGID=""
 
 # The loader normally exits after the selected child is gone. Give it time.
 for _ in $(seq 1 30); do
-    if ! kill -0 "$LOADER_PGID" 2>/dev/null; then
+    if ! kill -0 "$LOADER_PID" 2>/dev/null; then
         break
     fi
     sleep 0.1
 done
 
-if kill -0 "$LOADER_PGID" 2>/dev/null; then
-    kill_group_root "$LOADER_PGID"
+if kill -0 "$LOADER_PID" 2>/dev/null; then
+    kill_root_process "$LOADER_PID"
 fi
-wait "$LOADER_PGID" 2>/dev/null || true
-LOADER_PGID=""
+wait "$LOADER_PID" 2>/dev/null || true
+LOADER_PID=""
 
 # sched_ext/BPF teardown may be briefly asynchronous.
 for _ in $(seq 1 50); do
