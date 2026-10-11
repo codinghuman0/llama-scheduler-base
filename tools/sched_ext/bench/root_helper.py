@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import secrets
 import re
+import pwd
 import select
 import selectors
 import signal
@@ -17,7 +18,8 @@ import time
 
 # -I ignores caller Python configuration; import only this fixed source directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import (RESULTS, SCHED, TAGS, bpf_timeline, canonical, identity,
+import common
+from common import (HOUSE_CPUS, HOST, UID, RESULTS, SCHED, TAGS, bpf_timeline, canonical, identity,
                     live_project_processes, project_objects, read_json, reduced_bpf,
                     order, require, same_process, scheduler_check, sha, signal_exact,
                     state, write_json)
@@ -40,13 +42,14 @@ def validate_message(message, token):
 class Helper:
     def __init__(self, run):
         self.run = run
-        require(run.parent == RESULTS.resolve() and run.is_dir() and run.stat().st_uid == 1000, 'Invalid campaign directory')
+        require(run.parent == RESULTS.resolve() and run.is_dir() and run.stat().st_uid == UID, 'Invalid campaign directory')
         self.manifest = read_json(run / 'manifest.json')
         require(self.manifest['status'] == 'PREPARED', 'Campaign is not prepared')
-        require(self.manifest['tags'] == TAGS and self.manifest['uid'] == 1000, 'Campaign identity differs')
+        require(self.manifest['tags'] == TAGS and self.manifest['uid'] == UID, 'Campaign identity differs')
         require(self.manifest['order'] == order(), 'Campaign order differs from the fixed loader whitelist')
         for name, digest in self.manifest['helper_sources'].items():
             require(sha(Path(__file__).parent / name) == digest, 'Helper source identity changed')
+        require(sha(run / 'host-profile.json') == self.manifest['host_profile_sha256'] and read_json(run / 'host-profile.json') == HOST, 'Frozen campaign profile differs')
         scheduler_check()
         self.c_artifact = read_json(run / 'artifacts.json')['C']
         require(self.c_artifact['revision'] == TAGS['llama-side-lightweight-v1'] and self.c_artifact['hint'] == 'ON' and self.c_artifact['trace'] == 'OFF', 'C artifact definition differs')
@@ -76,7 +79,7 @@ class Helper:
 
     def ready(self):
         return dict(helper=identity(os.getpid()), socket=self.socket_name, token=self.token,
-                    lifetime_seconds=MAX_LIFETIME, allowed_uid=1000, baseline='bpf-baseline.json')
+                    lifetime_seconds=MAX_LIFETIME, allowed_uid=UID, baseline='bpf-baseline.json')
 
     def append_log(self):
         data = os.read(self.child['process'].stderr.fileno(), 65536)
@@ -102,9 +105,9 @@ class Helper:
         path = self.run / 'raw' / f'{visit:02d}-D'
         require(path.is_dir() and not path.is_symlink(), 'Visit directory is not ready')
         registration = 'llama_scx_step10_' + self.run.name + '_' + str(visit)
-        argv = [str(SCHED / 'bin/llama_scx'), '--phase-uid', '1000', '--phase-register-socket', '@' + registration,
+        argv = [str(SCHED / 'bin/llama_scx'), '--phase-uid', str(UID), '--phase-register-socket', '@' + registration,
                 '--server-exe', str(bundle / 'bin/llama-server'), '--marker-elf', str(bundle / 'bin/libllama-server-impl.so')]
-        env = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'HOME': '/root'}
+        env = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'HOME': pwd.getpwuid(0).pw_dir}
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.PIPE, env=env, cwd='/', start_new_session=True)
         try:
@@ -123,7 +126,7 @@ class Helper:
         self.selector.register(self.child['pidfd'], selectors.EVENT_READ, 'loader_exit')
         self.selector.register(process.stderr, selectors.EVENT_READ, 'loader_log')
         write_json(path / 'loader-command.json', dict(argv=argv, identity=saved))
-        require(saved['uid'] == 0 and saved['policy'] == 0 and saved['affinity'] == [10], 'Loader identity/affinity differs')
+        require(saved['uid'] == 0 and saved['policy'] == 0 and saved['affinity'] == sorted(HOUSE_CPUS), 'Loader identity/affinity differs')
         end = time.monotonic() + 20
         while b'scheduler active; waiting for selected child' not in self.child['startup_output']:
             require(time.monotonic() < end, 'Loader startup deadline exceeded')
@@ -206,7 +209,7 @@ class Helper:
             _, uid, _ = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
             previous_child = self.child
             try:
-                require(uid == 1000, 'Only UID 1000 may use this helper')
+                require(uid == UID, 'Only the frozen profile UID may use this helper')
                 packet = peer.recv(4097)
                 require(len(packet) <= 4096, 'Oversized command')
                 message = json.loads(packet)
@@ -249,7 +252,11 @@ class Helper:
 
 def arm(run):
     require(os.getuid() == 0, 'Root privilege is required for this helper')
-    require(os.sched_getaffinity(0) == {10}, 'Root helper must be pinned to CPU 10')
+    common.load_profile(run / 'host-profile.json')
+    require(int(os.environ.get('SUDO_UID', '-1')) == UID, 'Sudo invoking UID differs from frozen profile')
+    import host_profile
+    host_profile.validate_current(HOST)
+    require(os.sched_getaffinity(0) == HOUSE_CPUS, 'Root helper must use the frozen housekeeping set')
     read_fd, write_fd = os.pipe()
     pid = os.fork()
     if pid:

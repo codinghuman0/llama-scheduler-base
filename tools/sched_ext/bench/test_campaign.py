@@ -21,6 +21,16 @@ import root_helper
 import step10
 
 
+def synthetic_host():
+    common.HOST.clear()
+    common.HOST.update(allocation=dict(status='PASS', reason=None), capabilities=dict(temperature_sensor='unavailable'))
+    common.SERVER_CPUS.clear()
+    common.SERVER_CPUS.update({3, 9})
+    common.HOUSE_CPUS.clear()
+    common.HOUSE_CPUS.update({17})
+    common.THREADS.update(compute=2, batch=2, http=2)
+
+
 def response():
     return dict(content='synthetic fixture', truncated=False, stop_type='limit', tokens_evaluated=900,
                 tokens_predicted=128, timings=dict(cache_n=0, prompt_n=900, predicted_n=128,
@@ -28,6 +38,9 @@ def response():
 
 
 class CampaignTests(unittest.TestCase):
+    def setUp(self):
+        synthetic_host()
+
     def test_all_phases_require_closed_apps_before_work(self):
         for phase in ('prepare', 'arm', 'campaign', 'finalize'):
             with self.subTest(phase=phase), patch.object(machine, 'stop_codex_daemons', return_value=[]) as stop, \
@@ -52,7 +65,9 @@ class CampaignTests(unittest.TestCase):
         with patch.object(sys, 'argv', ['step10.py', 'prepare']), \
              patch.object(step10.signal, 'signal', side_effect=lambda sig, handler: handlers.__setitem__(sig, handler)), \
              patch.object(step10, 'run_phase') as execute:
-            step10.main()
+            with patch.object(common, 'load_profile'), patch.object(step10.host_profile, 'validate_current'), \
+                 patch.object(step10.os, 'sched_setaffinity'), patch.object(step10.os, 'sched_getaffinity', return_value=common.HOUSE_CPUS):
+                step10.main()
             execute.assert_called_once_with('prepare', reuse_artifacts=False)
         self.assertEqual(set(handlers), {signal.SIGHUP, signal.SIGINT, signal.SIGTERM})
         with self.assertRaisesRegex(RuntimeError, 'interrupted by signal'):
@@ -98,6 +113,10 @@ class CampaignTests(unittest.TestCase):
             stack.enter_context(patch.object(step10, 'topology', return_value={}))
             stack.enter_context(patch.object(step10, 'model_identity', return_value={}))
             stack.enter_context(patch.object(step10, 'toolchain', return_value={}))
+            profile = root / 'host-profile.json'
+            common.write_json(profile, common.HOST)
+            stack.enter_context(patch.object(step10, 'PROFILE_PATH', profile))
+            stack.enter_context(patch.object(step10.host_profile, 'validate_current'))
             stack.enter_context(patch.object(step10, 'validate_entry_points'))
             stack.enter_context(patch.object(step10, 'require_no_helper'))
             stack.enter_context(patch.object(step10, 'sources', return_value={}))
@@ -191,7 +210,7 @@ class CampaignTests(unittest.TestCase):
     def test_daemon_shutdown_refuses_an_active_cli_before_any_signal(self):
         with patch.object(machine, 'interactive_apps', return_value=([], ['123 codex 0.0 /usr/bin/codex'])), \
              patch.object(Path, 'read_bytes', return_value=b'/usr/bin/codex\0'), \
-             patch.object(machine, 'identity', return_value=dict(pid=123, uids=[1000]*4)), \
+             patch.object(machine, 'identity', return_value=dict(pid=123, uids=[common.UID]*4)), \
              patch.object(machine, 'signal_exact') as send:
             with self.assertRaisesRegex(RuntimeError, 'Exit interactive'):
                 machine.stop_codex_daemons()
@@ -200,7 +219,7 @@ class CampaignTests(unittest.TestCase):
     def test_daemon_shutdown_uses_only_verified_identity_and_sigterm(self):
         daemon = str(Path.home() / '.codex/packages/app-server-daemon/releases/fixture/bin/codex')
         argv = [daemon, 'app-server', '--listen', 'unix://', '--managed-daemon']
-        saved = dict(pid=123, starttime='fixture', uids=[1000]*4)
+        saved = dict(pid=123, starttime='fixture', uids=[common.UID]*4)
         alive = [True]
         with patch.object(machine, 'interactive_apps', return_value=([], ['123 codex 0.0 ' + ' '.join(argv)])), \
              patch.object(Path, 'read_bytes', return_value=('\0'.join(argv)+'\0').encode()), \
@@ -215,14 +234,14 @@ class CampaignTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)
             bundle = path / 'bundle'
-            server = dict(pid=123, ppid=122, uids=[1000]*4)
+            server = dict(pid=123, ppid=122, uids=[common.UID]*4)
             (path / 'server.stdout.log').write_text('phase_uprobe_registered_tgid=123\n')
             original_resolve = Path.resolve
             def resolve(value, *args, **kwargs):
                 return bundle / 'bin/llama-server' if str(value) == '/proc/123/exe' else original_resolve(value, *args, **kwargs)
             with patch.object(step10, 'identity', return_value=server), patch.object(Path, 'resolve', resolve):
                 self.assertEqual(step10.registered_child(path, dict(pid=122), bundle), (server, False))
-                (path / 'loader.log').write_text('llama_scx: registered tgid=123 uid=1000\n')
+                (path / 'loader.log').write_text(f'llama_scx: registered tgid=123 uid={common.UID}\n')
                 self.assertEqual(step10.registered_child(path, dict(pid=122), bundle), (server, True))
 
     def test_failed_loader_start_is_rolled_back_before_error_response(self):
@@ -285,7 +304,7 @@ class CampaignTests(unittest.TestCase):
             operations.append(operation)
             if operation in {'FINISH', 'ABORT'}:
                 alive[0] = False
-            return dict(helper=dict(policy=0, affinity=[10]))
+            return dict(helper=dict(policy=0, affinity=sorted(common.HOUSE_CPUS)))
         def visit(_run, plan, _baseline, _count):
             visits.append(plan['visit'])
             if plan['visit'] == fail_visit:
@@ -298,7 +317,7 @@ class CampaignTests(unittest.TestCase):
                                     model_identity=lambda: {}, port_free=lambda: None, wait_gone=lambda _: None,
                                     same_process=lambda _: alive[0]).items():
                 stack.enter_context(patch.object(step10, name, value))
-            stack.enter_context(patch.object(step10.os, 'sched_getaffinity', return_value={11}))
+            stack.enter_context(patch.object(step10.os, 'sched_getaffinity', return_value=common.HOUSE_CPUS))
             stack.enter_context(patch.object(step10.os, 'sched_getscheduler', return_value=0))
             stack.enter_context(patch.object(machine, 'snapshot', return_value={}))
             stack.enter_context(patch.object(machine, 'validate'))
@@ -350,7 +369,7 @@ class CampaignTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             run = Path(temp)
             common.write_json(run/'manifest.json', dict(status='PREPARED', kernel='fixture', boot_id='fixture', btf_sha256='fixture'))
-            ready = dict(helper=dict(uid=0, policy=0, affinity=[10]))
+            ready = dict(helper=dict(uid=0, policy=0, affinity=sorted(common.HOUSE_CPUS)))
             calls = []
             def request(_run, op):
                 calls.append(op)
@@ -411,7 +430,7 @@ class CampaignTests(unittest.TestCase):
                                 protocol={'sha256':common.sha(previous/'protocol.md')}, request_sha256=common.REQUEST_SHA,
                                 prompt_sha256=common.PROMPT_SHA, metrics=list(analysis.METRICS), warmups_per_visit=2,
                                 measured_per_config=10, bootstrap_seed=20261006, bootstrap_draws=10000,
-                                order=common.order(), scheduler_hashes=common.SCHED_HASHES, uid=1000)
+                                order=common.order(), scheduler_hashes=common.SCHED_HASHES, uid=common.UID)
             common.write_json(previous/'manifest.json', old_manifest)
             artifacts = {}
             for cfg in 'ABC':
@@ -475,7 +494,7 @@ class CampaignTests(unittest.TestCase):
 
     def test_affinity_and_d_bundle_identity(self):
         self.assertEqual(common.parse_cpus('0-2,4,6,8,10-11'), {0,1,2,4,6,8,10,11})
-        self.assertEqual(sum(1 << cpu for cpu in common.SERVER_CPUS), 0x155)
+        self.assertEqual(len(common.SERVER_CPUS), common.THREADS['compute'])
         self.assertFalse(common.SERVER_CPUS & common.HOUSE_CPUS)
         with tempfile.TemporaryDirectory() as temp:
             run = Path(temp)
@@ -483,15 +502,15 @@ class CampaignTests(unittest.TestCase):
             d, d_bundle = step10.server_argv(run, 'D')
             self.assertEqual(c, d)
             self.assertEqual(c_bundle, d_bundle)
-            self.assertEqual(c[c.index('--threads')+1], '5')
-            self.assertEqual(c[c.index('--threads-batch')+1], '5')
+            self.assertEqual(c[c.index('--threads')+1], str(common.THREADS['compute']))
+            self.assertEqual(c[c.index('--threads-batch')+1], str(common.THREADS['batch']))
             a, _ = step10.server_argv(run, 'A')
             self.assertNotIn('--server-compute-profile-mode', a)
 
     def test_sanitized_environment(self):
         with patch.dict(os.environ, {'OMP_NUM_THREADS': '99', 'GOMP_CPU_AFFINITY': '1', 'LD_PRELOAD': 'bad', 'CMAKE_TOOLCHAIN_FILE': 'bad', 'CC': 'bad'}):
             env = common.bundle_env(Path('/tmp/fixture'))
-            self.assertEqual(env['OMP_NUM_THREADS'], '5')
+            self.assertEqual(env['OMP_NUM_THREADS'], str(common.THREADS['compute']))
             self.assertEqual(env['LD_LIBRARY_PATH'], '/tmp/fixture/bin')
             for key in ('LD_PRELOAD', 'GOMP_CPU_AFFINITY', 'CMAKE_TOOLCHAIN_FILE', 'CC'):
                 self.assertNotIn(key, env)
@@ -535,7 +554,7 @@ class CampaignTests(unittest.TestCase):
                         (build / 'bin/libllama.so').symlink_to('libllama.so.0')
                     elif '--version' in argv:
                         self.assertTrue(Path(argv[-2]).exists())
-                        self.assertEqual(argv[:3], ['/usr/bin/taskset', '-c', '0,2,4,6,8'])
+                        self.assertEqual(argv[:3], ['/usr/bin/taskset', '-c', ','.join(map(str, sorted(common.SERVER_CPUS)))])
                         self.assertTrue((run / '.prepare' / config / 'build').exists())
                         return revision[:9]
                     return ''
@@ -662,8 +681,8 @@ class CampaignTests(unittest.TestCase):
             common.write_json(run / 'visit-order.json', common.order())
             artifact = dict(files={'bin/llama-server':'synthetic'}, revision='synthetic')
             common.write_json(run / 'artifacts.json', {c: artifact for c in 'ABC'})
-            snapshot = dict(kernel='fixture',boot_id='fixture',topology={},boost='1',ac={'ADP0':'1'},tctl_c=40,loadavg=[0,0,0],
-                            policies={'policy0':dict(scaling_driver='acpi-cpufreq',scaling_governor='schedutil')})
+            snapshot = dict(kernel='fixture',boot_id='fixture',topology={},loadavg=[0,0,0],temperature_sensor='unavailable',temperature_c=None,
+                            frequency=dict(available=False, policies={}), turbo=dict(available=False, interfaces={}), power_supply=dict(available=False, entries={}))
             common.write_json(run / 'machine.json', dict(before=snapshot))
             ready = dict(first=snapshot, second=snapshot, third=snapshot, busy_pct=0, second_busy_pct=0, ready=True)
             for block in range(1,11):
@@ -673,7 +692,7 @@ class CampaignTests(unittest.TestCase):
                 path.mkdir()
                 common.write_json(path / 'readiness.json', [ready])
                 common.write_json(path / 'visit.json', plan | dict(status='VALID',artifact_files=artifact['files'],request_sha256=common.REQUEST_SHA))
-                common.write_json(path / 'command.json', dict(revision='synthetic',affinity=sorted(common.SERVER_CPUS),compute_threads=5,batch_threads=5,http_threads=2))
+                common.write_json(path / 'command.json', dict(revision='synthetic',affinity=sorted(common.SERVER_CPUS),compute_threads=common.THREADS['compute'],batch_threads=common.THREADS['batch'],http_threads=2))
                 common.write_json(path / 'cleanup.json', dict(status='PASS',server_launcher_exit=0,sched_ext='disabled',port_free=True,
                                                              root=dict(clean=True,loader_exit=0,loader_sigterm_requested=False,timeline=[dict(project_objects=[])])))
                 for role in ('warmup-1','warmup-2','measured'):
@@ -681,8 +700,8 @@ class CampaignTests(unittest.TestCase):
                     common.write_json(path / f'{role}-client.json', dict(role=role,http_status=200,request_sha256=common.REQUEST_SHA,
                                                                        response_sha256=common.sha(path / f'{role}-response.json'),request_wall_ms=1000))
                 for name in ('before','pre-measured','after'):
-                    common.write_json(path / f'policies-{name}.json', dict(tids=[dict(uid=1000,policy=7 if plan['config']=='D' else 0,affinity=sorted(common.SERVER_CPUS))],
-                                                                        runner=dict(policy=0,affinity=[11]),launcher=dict(policy=0,uid=1000,affinity=[11]),loader=dict(policy=0,uid=0,affinity=[10])))
+                    common.write_json(path / f'policies-{name}.json', dict(tids=[dict(uid=common.UID,policy=7 if plan['config']=='D' else 0,affinity=sorted(common.SERVER_CPUS))],
+                                                                        runner=dict(policy=0,affinity=sorted(common.HOUSE_CPUS)),launcher=dict(policy=0,uid=common.UID,affinity=sorted(common.HOUSE_CPUS)),loader=dict(policy=0,uid=0,affinity=sorted(common.HOUSE_CPUS))))
                 for name in ('before','after'):
                     common.write_json(path / f'system-{name}.json', snapshot)
             rows = step10.collect_rows(run)

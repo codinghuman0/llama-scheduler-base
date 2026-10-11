@@ -21,12 +21,14 @@ set -Eeuo pipefail
 # No root privilege is required.
 
 ENV_OUT=""
+JSON_OUT=""
 
 usage() {
     cat <<'EOF'
-Usage: detect_host_topology.sh [--env FILE]
+Usage: detect_host_topology.sh [--env FILE] [--json FILE]
 
   --env FILE   Also write the resolved topology as shell-safe KEY=VALUE lines.
+  --json FILE  Also write machine-readable topology.
   -h, --help   Show this help.
 EOF
 }
@@ -36,6 +38,11 @@ while (($#)); do
         --env)
             (($# >= 2)) || { echo "ERROR: --env requires a file" >&2; exit 2; }
             ENV_OUT="$2"
+            shift 2
+            ;;
+        --json)
+            (($# >= 2)) || { echo "ERROR: --json requires a file" >&2; exit 2; }
+            JSON_OUT="$2"
             shift 2
             ;;
         -h|--help)
@@ -58,7 +65,8 @@ command -v python3 >/dev/null 2>&1 || {
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
-python3 - "$ENV_OUT" >"$TMP" <<'PY'
+python3 - "$ENV_OUT" "$JSON_OUT" >"$TMP" <<'PY'
+import json
 import os
 import platform
 import re
@@ -67,6 +75,7 @@ import sys
 from collections import defaultdict
 
 env_out = sys.argv[1]
+json_out = sys.argv[2]
 SYS_CPU = "/sys/devices/system/cpu"
 
 def read(path, default=""):
@@ -353,6 +362,20 @@ if env_out:
             f.write(f"{k}={shlex.quote(vals[k])}\n")
         f.write("TOPOLOGY_RESULT=PASS\n")
     os.replace(tmp, env_out)
+
+if json_out:
+    value = dict(vendor=vendor, model=model, online_cpus=sorted(online), allowed_cpus=sorted(allowed), usable_cpus=usable,
+                 physical_core_representatives=selected, physical_cores=len(cores), logical_cpus=len(usable),
+                 smt=dict(present=smt_present, effective=smt_effective, max_threads_per_core=max_threads_per_core,
+                          active=read(f"{SYS_CPU}/smt/active", "unavailable"), control=read(f"{SYS_CPU}/smt/control", "unavailable")),
+                 packages=packages, dies=dies, numa_nodes=numa_nodes, cpus=per_cpu,
+                 heterogeneous=dict(core_type_exposed=core_type_exposed, multiple_core_types=hetero_core_type,
+                                    core_types=distinct_core_types, frequency_hint=hetero_freq_hint, max_freq_classes_khz=distinct_max_freqs))
+    os.makedirs(os.path.dirname(os.path.abspath(json_out)), exist_ok=True)
+    with open(json_out + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(value, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(json_out + ".tmp", json_out)
 PY
 
 cat "$TMP"

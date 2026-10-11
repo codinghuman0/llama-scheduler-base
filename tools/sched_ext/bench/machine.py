@@ -1,46 +1,47 @@
 # SPDX-License-Identifier: GPL-2.0
 """Checkpoints run outside requests; there is no background observer."""
+import math
 import os
 from pathlib import Path
 import re
 import signal
 import time
 
-from common import BOOT_ID, command, identity, require, same_process, signal_exact, topology, write_json
+from common import BOOT_ID, HOST, UID, command, identity, require, same_process, signal_exact, topology, write_json
 
 
 def snapshot():
-    cpu = Path('/sys/devices/system/cpu')
-    policies = {}
-    for policy in sorted((cpu / 'cpufreq').glob('policy*')):
-        policies[policy.name] = {key: (policy / key).read_text().strip() for key in
-                                 ('scaling_driver', 'scaling_governor', 'scaling_cur_freq', 'scaling_min_freq', 'scaling_max_freq')}
-    temperatures = []
-    for hwmon in Path('/sys/class/hwmon').glob('hwmon*'):
-        if (hwmon / 'name').read_text().strip() == 'k10temp':
-            for label in hwmon.glob('temp*_label'):
-                if label.read_text().strip() == 'Tctl':
-                    temperatures.append(int(label.with_name(label.name.replace('_label', '_input')).read_text()) / 1000)
-    ac = {p.parent.name: p.read_text().strip() for p in Path('/sys/class/power_supply').glob('*/online')}
+    import host_profile
+    capabilities = host_profile.capabilities()
     memory = {k: int(v) for k, v in re.findall(r'^(MemAvailable|SwapTotal|SwapFree):\s+(\d+)', Path('/proc/meminfo').read_text(), re.M)}
     return dict(kernel=os.uname().release, boot_id=BOOT_ID.read_text().strip(), topology=topology(),
-                policies=policies, boost=(cpu / 'cpufreq/boost').read_text().strip(), ac=ac,
-                tctl_c=temperatures[0] if len(temperatures) == 1 else None,
-                loadavg=list(os.getloadavg()), memory_kib=memory,
+                **capabilities, loadavg=list(os.getloadavg()), memory_kib=memory,
                 runner_affinity=sorted(os.sched_getaffinity(0)), monotonic_ns=time.monotonic_ns())
 
 
 def invariants(value):
-    return {key: value[key] for key in ('kernel', 'boot_id', 'topology', 'boost', 'ac')} | {
-        'policies': {p: {k: v for k, v in fields.items() if k != 'scaling_cur_freq'} for p, fields in value['policies'].items()}}
+    import host_profile
+    return {key: value[key] for key in ('kernel', 'boot_id', 'topology')} | host_profile.execution_state(value)
 
 
 def validate(value, baseline=None):
-    require(value['policies'] and all(p['scaling_driver'] == 'acpi-cpufreq' and p['scaling_governor'] == 'schedutil' for p in value['policies'].values()), 'CPU governor/driver differs from frozen protocol')
-    require(value['boost'] == '1' and value['ac'] and all(v == '1' for v in value['ac'].values()), 'AC/boost state unsuitable')
-    require(value['tctl_c'] is not None, 'Tctl interface missing')
+    sensor = value['temperature_sensor']
+    require((sensor == 'unavailable' and value['temperature_c'] is None) or
+            (isinstance(sensor, dict) and isinstance(value['temperature_c'], (int, float)) and math.isfinite(value['temperature_c'])), 'Temperature capability/value differs')
     if baseline:
         require(invariants(value) == invariants(baseline), 'Machine configuration changed during campaign')
+    elif HOST:
+        import host_profile
+        require(value['kernel'] == HOST['host']['kernel'] and value['boot_id'] == HOST['host']['boot_id']
+                and value['topology'] == HOST['topology']
+                and host_profile.execution_state(value) == host_profile.execution_state(HOST['capabilities']), 'Machine differs from frozen host profile')
+
+
+def thermal_ready(samples):
+    if samples[0]['temperature_sensor'] == 'unavailable':
+        return all(s['temperature_c'] is None and s['loadavg'][0] <= 1 for s in samples)
+    temperatures = [s['temperature_c'] for s in samples]
+    return max(temperatures) <= 55 and max(temperatures) - min(temperatures) <= 2
 
 
 def counters():
@@ -80,7 +81,8 @@ def reject_interactive_apps():
 def managed_codex_daemon(argv):
     if not argv:
         return False
-    root = Path.home() / '.codex/packages/app-server-daemon/releases'
+    import common
+    root = common.USER_HOME / '.codex/packages/app-server-daemon/releases'
     executable = Path(argv[0])
     if (not executable.is_relative_to(root) or executable.parent.name != 'bin'
             or executable.parent.parent.parent != root or executable.parent.parent.name in {'.', '..'}):
@@ -91,7 +93,7 @@ def managed_codex_daemon(argv):
 
 
 def stop_codex_daemons():
-    require(os.getuid() == 1000, 'Only the selected normal user may stop their managed daemons')
+    require(os.getuid() == UID and UID != 0, 'Only the selected normal user may stop their managed daemons')
     _, offenders = interactive_apps()
     targets, other = [], []
     for row in offenders:
@@ -101,7 +103,7 @@ def stop_codex_daemons():
             saved = identity(pid)
         except (FileNotFoundError, ProcessLookupError):
             continue
-        if saved['uids'] == [1000] * 4 and managed_codex_daemon(argv):
+        if saved['uids'] == [UID] * 4 and managed_codex_daemon(argv):
             targets.append((saved, argv))
         else:
             other.append(row)
@@ -139,8 +141,7 @@ def readiness(run, name, baseline, *, after_warmup):
             third, sample3 = counters(), snapshot()
             validate(sample3, baseline)
             record.update(third=sample3, second_busy_pct=busy(second, third))
-            temps = [s['tctl_c'] for s in (sample1, sample2, sample3)]
-            ready = max(temps) <= 55 and max(temps) - min(temps) <= 2 and max(record['busy_pct'], record['second_busy_pct']) <= 5
+            ready = thermal_ready((sample1, sample2, sample3)) and max(record['busy_pct'], record['second_busy_pct']) <= 5
         else:
             ready = sample2['loadavg'][0] <= 1 and record['busy_pct'] <= 5
         record['ready'] = ready
@@ -159,8 +160,7 @@ def validate_readiness(readings, baseline, *, after_warmup):
         validate(record[name], baseline)
     require(0 <= record['busy_pct'] <= 5, 'Saved readiness CPU busy exceeds protocol')
     if after_warmup:
-        temperatures = [record[name]['tctl_c'] for name in names]
-        require(max(temperatures) <= 55 and max(temperatures) - min(temperatures) <= 2
+        require(thermal_ready([record[name] for name in names])
                 and 0 <= record['second_busy_pct'] <= 5, 'Saved cooldown exceeds protocol')
     else:
         require(record['second']['loadavg'][0] <= 1, 'Saved block load exceeds protocol')

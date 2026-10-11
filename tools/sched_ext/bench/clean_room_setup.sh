@@ -25,8 +25,7 @@ set -Eeuo pipefail
 #   MODEL=/path/model.gguf BUILD_JOBS=4 ./tools/sched_ext/bench/clean_room_setup.sh
 #   RUN_SMOKE=0 ./tools/sched_ext/bench/clean_room_setup.sh
 #
-# This script intentionally does NOT install Codex CLI. Codex interference is
-# measured separately after the Base environment is validated.
+# Setup runs correctness smoke only; no performance campaign.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)" || {
@@ -38,6 +37,7 @@ MODEL="${MODEL:-$(dirname "$REPO_ROOT")/model.gguf}"
 BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build-lightweight-dev}"
 BUILD_JOBS="${BUILD_JOBS:-$(nproc)}"
 RUN_SMOKE="${RUN_SMOKE:-1}"
+INSTALL_DEPS="${INSTALL_DEPS:-1}"
 
 RELEASE_TAG="lightweight-base-v1-release"
 EXPECTED_RELEASE_COMMIT="3f2f968cd6a8904f97659f82ca2ebbd10ce8b04a"
@@ -61,8 +61,11 @@ trap 'printf "\nERROR at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
 cd "$REPO_ROOT"
 
-[[ "$(uname -s)" == "Linux" ]] || die "Linux is required"
-command -v apt-get >/dev/null 2>&1 || die "apt-get not found; Ubuntu/Debian host required"
+[[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] || { block "Linux x86_64 is required"; exit 2; }
+[[ "$(id -u)" != 0 && "$(id -u)" == "$(stat -c %u "$REPO_ROOT")" ]] || die "run as the non-root repository owner"
+if [[ "$INSTALL_DEPS" == "1" ]]; then
+    command -v apt-get >/dev/null 2>&1 || die "automated package installation requires apt-get; install dependencies manually and set INSTALL_DEPS=0 on other Linux hosts"
+fi
 command -v sudo >/dev/null 2>&1 || die "sudo is required"
 [[ -x "$DETECTOR" ]] || die "topology detector missing/not executable: $DETECTOR"
 [[ -x "$SMOKE" ]] || die "portability smoke missing/not executable: $SMOKE"
@@ -79,7 +82,7 @@ printf 'origin: %s\n' "$(git remote get-url origin 2>/dev/null || echo none)"
 }
 ok "Git worktree clean"
 
-git fetch --tags origin >/dev/null 2>&1 || true
+python3 -B -c 'import sys; sys.path.insert(0, "tools/sched_ext/bench"); from common import repo_check; from host_profile import require_refreshable; repo_check(); require_refreshable()'
 
 if git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null; then
     RELEASE_COMMIT="$(git rev-parse "$RELEASE_TAG^{commit}")"
@@ -117,57 +120,72 @@ else
         || block "model SHA256 mismatch"
 fi
 
-say "Refreshing sudo credential"
-sudo -v
+[[ -r /sys/kernel/sched_ext/state && -r /sys/kernel/btf/vmlinux ]] || {
+    block "required sched_ext/BTF kernel interfaces missing"
+    printf "CLEAN_ROOM_PREFLIGHT_RESULT=BLOCKED\n"
+    exit 2
+}
 
-say "Installing build/runtime dependencies"
-sudo apt-get update
+if [[ "$INSTALL_DEPS" == "1" ]]; then
+    say "Refreshing sudo credential"
+    sudo -v
 
-REQUIRED_PKGS=(
-    ca-certificates
-    git
-    curl
-    wget
-    rsync
-    build-essential
-    binutils
-    cmake
-    ninja-build
-    pkg-config
-    python3
-    python3-venv
-    python3-pip
-    clang
-    llvm
-    lld
-    libbpf-dev
-    libelf-dev
-    zlib1g-dev
-    libcurl4-openssl-dev
-    jq
-    bc
-    numactl
-    stress-ng
-    bpftrace
-    linux-tools-common
-    util-linux
-)
+    say "Installing build/runtime dependencies"
+    sudo apt-get update
 
-sudo apt-get install -y "${REQUIRED_PKGS[@]}"
+    REQUIRED_PKGS=(
+        ca-certificates
+        git
+        curl
+        wget
+        rsync
+        build-essential
+        binutils
+        cmake
+        ninja-build
+        pkg-config
+        python3
+        python3-venv
+        python3-pip
+        clang
+        llvm
+        lld
+        libbpf-dev
+        libelf-dev
+        zlib1g-dev
+        libcurl4-openssl-dev
+        jq
+        bc
+        numactl
+        stress-ng
+        bpftrace
+        linux-tools-common
+        util-linux
+    )
 
-if apt-cache show dwarves >/dev/null 2>&1; then
-    sudo apt-get install -y dwarves
-fi
+    sudo apt-get install -y "${REQUIRED_PKGS[@]}"
+    KERNEL_HEADERS="linux-headers-$(uname -r)"
+    if apt-cache show "$KERNEL_HEADERS" >/dev/null 2>&1; then
+        sudo apt-get install -y "$KERNEL_HEADERS"
+    fi
 
-KERNEL_TOOLS="linux-tools-$(uname -r)"
-if apt-cache show "$KERNEL_TOOLS" >/dev/null 2>&1; then
-    sudo apt-get install -y "$KERNEL_TOOLS"
+    if apt-cache show dwarves >/dev/null 2>&1; then
+        sudo apt-get install -y dwarves
+    fi
+
+    KERNEL_TOOLS="linux-tools-$(uname -r)"
+    if apt-cache show "$KERNEL_TOOLS" >/dev/null 2>&1; then
+        sudo apt-get install -y "$KERNEL_TOOLS"
+    else
+        warn "$KERNEL_TOOLS not available from configured repositories"
+    fi
+
+    if ! command -v bpftool >/dev/null 2>&1 && apt-cache show bpftool >/dev/null 2>&1; then
+        sudo apt-get install -y bpftool
+    fi
+
 else
-    warn "$KERNEL_TOOLS not available from configured repositories"
-fi
-
-if ! command -v bpftool >/dev/null 2>&1 && apt-cache show bpftool >/dev/null 2>&1; then
-    sudo apt-get install -y bpftool
+    warn "dependency installation skipped; validate installed environment"
 fi
 
 say "Required command check"
@@ -242,7 +260,8 @@ if (( BLOCK > 0 )); then
 fi
 
 say "Topology detection"
-rm -rf "$BUILD_DIR"
+[[ "$BUILD_DIR" == "$REPO_ROOT"/build-* && ! -L "$BUILD_DIR" ]] || die "BUILD_DIR must be a repository-local build-* directory"
+mkdir -p "$BUILD_DIR"
 mkdir -p "$BUILD_DIR/portability"
 
 TOPOLOGY_ENV="$BUILD_DIR/portability/topology.env"
@@ -254,7 +273,7 @@ source "$TOPOLOGY_ENV"
 [[ "${CPU_SELECTED_COUNT:-0}" -ge 1 ]] || die "topology detector selected no CPU"
 ok "host topology resolved"
 
-say "Fresh llama-server build: HINT ON / TRACE OFF"
+say "llama-server build: HINT ON / TRACE OFF"
 cmake -S . -B "$BUILD_DIR" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_SHARED_LIBS=ON \
@@ -270,7 +289,7 @@ MARKER="$BUILD_DIR/bin/libllama-server-impl.so"
 
 [[ -x "$SERVER" ]] || die "llama-server missing after build"
 [[ -f "$MARKER" ]] || die "libllama-server-impl.so missing after build"
-ok "fresh llama-server build"
+ok "llama-server build"
 
 CACHE_HINT="$(grep -E '^LLAMA_SCX_PHASE_HINT:BOOL=' "$BUILD_DIR/CMakeCache.txt" || true)"
 CACHE_TRACE="$(grep -E '^LLAMA_SCX_PHASE_TRACE:BOOL=' "$BUILD_DIR/CMakeCache.txt" || true)"
@@ -293,8 +312,15 @@ else
 fi
 
 say "Fresh lightweight sched_ext build"
-rm -rf "$REPO_ROOT/tools/sched_ext/build"
-make -C "$REPO_ROOT/tools/sched_ext" -j"$BUILD_JOBS"
+if ! if ! make -B -C "$REPO_ROOT/tools/sched_ext" -j"$BUILD_JOBS"; then
+    block "neutral scheduler build failed; check matching kernel UAPI headers and compiler/libbpf support"
+    printf 'CLEAN_ROOM_BUILD_RESULT=BLOCKED\n'
+    exit 2
+fi; then
+    block "neutral scheduler build failed; check matching kernel UAPI headers and compiler/libbpf support"
+    printf 'CLEAN_ROOM_BUILD_RESULT=BLOCKED\n'
+    exit 2
+fi
 
 SCHED="$REPO_ROOT/tools/sched_ext/build/bin/llama_scx"
 CHILD="$REPO_ROOT/tools/sched_ext/build/bin/llama_scx_child"
@@ -322,6 +348,10 @@ else
     warn "runtime smoke skipped because RUN_SMOKE=$RUN_SMOKE"
 fi
 
+say "Generate portable benchmark host profile"
+python3 -B "$SCRIPT_DIR/host_profile.py" --model "$MODEL" --refresh
+ok "portable host profile generated"
+
 say "Final clean-room state"
 printf 'repo:          %s\n' "$REPO_ROOT"
 printf 'HEAD:          %s\n' "$(git rev-parse HEAD)"
@@ -342,4 +372,8 @@ printf '\nPASS checks:    %d\n' "$PASS"
 printf 'WARN checks:    %d\n' "$WARN"
 printf 'BLOCKED checks: %d\n' "$BLOCK"
 
-printf '\n\033[1;32mCLEAN_ROOM_SETUP_RESULT=PASS\033[0m\n'
+if [[ "$RUN_SMOKE" == "1" ]]; then
+    printf '\n\033[1;32mCLEAN_ROOM_SETUP_RESULT=PASS\033[0m\n'
+else
+    printf '\nCLEAN_ROOM_BUILD_PROFILE_RESULT=PASS (runtime smoke skipped)\n'
+fi

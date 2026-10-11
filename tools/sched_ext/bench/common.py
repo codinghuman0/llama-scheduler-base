@@ -8,6 +8,8 @@ import math
 import os
 from pathlib import Path
 import re
+import pwd
+import shutil
 import select
 import signal
 import socket
@@ -18,7 +20,12 @@ import time
 REPO = Path(__file__).resolve().parents[3]
 BENCH = Path(__file__).resolve().parent
 RESULTS = REPO / 'benchmark-results/step10'
-MODEL = Path('/home/codinghuman/projects/model.gguf')
+MODEL = Path(os.environ.get('MODEL', str(REPO.parent / 'model.gguf'))).expanduser().resolve()
+UID = REPO.stat().st_uid
+USER_HOME = Path(pwd.getpwuid(UID).pw_dir)
+HOST = {}
+THREADS = dict(compute=0, batch=0, http=2)
+PROFILE_PATH = REPO / 'benchmark-results/host-profile.json'
 MODEL_SHA = 'f3bdf9cf31dee4b57ae4e455a1cb0d01b5c2c1b50d72d3112141c195506c2840'
 TAGS = {
     'original-performance-baseline-v1': '7a2db1a0cf38e5f4eb278a58c3903d295258d0ea',
@@ -27,14 +34,10 @@ TAGS = {
     'one-repo-golden-validation-v1': '542850645a54fc2e35a9a8189ff8dfcf35b9c51d',
 }
 REVISIONS = dict(zip('ABC', [TAGS['original-performance-baseline-v1']] + [TAGS['llama-side-lightweight-v1']] * 2))
-SCHED_HASHES = {
-    'llama_scx.bpf.o': '45ae9ae69ee9ab2ecf7ea6a326b33db52d75dd100f16901068a335f95f6cd86c',
-    'bin/llama_scx': '2e6abb63c5a7519cdb01becaf7df0fdf8966a15afcc67f9800849c54843f7341',
-    'bin/llama_scx_child': '459669650fdf02cd9642410d30ec022bb09c0915021f291d014a22714514210a',
-}
+SCHED_HASHES = {}
 SCHED = REPO / 'tools/sched_ext/build'
-SERVER_CPUS = {0, 2, 4, 6, 8}
-HOUSE_CPUS = {10, 11}
+SERVER_CPUS = set()
+HOUSE_CPUS = set()
 PORT = 8096
 MIN_FREE = 512 * 1024 * 1024
 BOOT_ID = Path('/proc/sys/kernel/random/boot_id')
@@ -177,17 +180,30 @@ def parse_cpus(text):
     return result
 
 
+def load_profile(path=PROFILE_PATH):
+    global MODEL, USER_HOME
+    import host_profile
+    value = host_profile.load(path)
+    HOST.clear()
+    HOST.update(value)
+    MODEL = Path(value['model']['path'])
+    USER_HOME = Path(value['home'])
+    SERVER_CPUS.clear()
+    SERVER_CPUS.update(value['allocation']['server_cpus'])
+    HOUSE_CPUS.clear()
+    HOUSE_CPUS.update(value['allocation']['housekeeping_cpus'])
+    THREADS.update(compute=value['allocation']['compute_threads'], batch=value['allocation']['batch_threads'], http=value['allocation']['http_threads'])
+    SCHED_HASHES.clear()
+    SCHED_HASHES.update(value['scheduler']['hashes'])
+    return value
+
+
 def topology():
-    root = Path('/sys/devices/system/cpu')
-    online = parse_cpus((root / 'online').read_text())
-    pairs = {str(cpu): sorted(parse_cpus((root / f'cpu{cpu}/topology/thread_siblings_list').read_text())) for cpu in online}
-    require(online == set(range(12)), 'Online CPU set changed')
-    require(all(pairs[str(cpu)] == [cpu // 2 * 2, cpu // 2 * 2 + 1] for cpu in online), 'SMT sibling topology changed')
-    require((root / 'smt/active').read_text().strip() == '1', 'SMT state changed')
-    model = re.search(r'^model name\s*:\s*(.+)$', Path('/proc/cpuinfo').read_text(), re.M).group(1)
-    require('AMD Ryzen 5 5500U' in model, 'CPU model differs from frozen host')
-    return dict(model_name=model, online=sorted(online), siblings=pairs, server_cpus=sorted(SERVER_CPUS),
-                housekeeping_cpus=sorted(HOUSE_CPUS), compute_threads=5, batch_threads=5)
+    import host_profile
+    require(HOST, 'Generate/load a host profile first')
+    current = host_profile.discover_topology(HOST['topology']['allowed_cpus'])
+    require(current == HOST['topology'], 'Host topology changed')
+    return current
 
 
 def model_identity():
@@ -195,22 +211,42 @@ def model_identity():
     return dict(path=str(MODEL), size=MODEL.stat().st_size, sha256=MODEL_SHA)
 
 
-def repo_check():
+ACCEPTED_BASE = '340468bd398624027624060198393d90aed42873'
+PORTABLE_FILES = {
+    'README.md', 'tools/sched_ext/BENCHMARK_PROTOCOL.md', 'tools/sched_ext/SEASON2_EXPERIMENT_PROTOCOL.md',
+} | {'tools/sched_ext/bench/' + name for name in (
+    'README.md', 'common.py', 'machine.py', 'host_profile.py', 'step10.py', 'root_helper.py', 'test_campaign.py',
+    'test_host_profile.py', 'detect_host_topology.sh', 'clean_room_setup.sh', 'portability_smoke.sh',
+    'step10_phase_a_prepare.sh', 'step10_phase_b_arm.sh', 'step10_phase_c_campaign.sh', 'step10_phase_d_finalize.sh')}
+REQUIRED_TAGS = TAGS | {'lightweight-base-v1-release': '3f2f968cd6a8904f97659f82ca2ebbd10ce8b04a'}
+
+
+def repo_check(*, allow_dirty=False):
     require(command(['git', 'rev-parse', '--show-toplevel']) == str(REPO), 'Repository mismatch')
     require(command(['git', 'branch', '--show-current']) == 'lightweight-base', 'Branch mismatch')
-    require(not command(['git', 'status', '--porcelain']), 'Worktree must be clean')
+    if not allow_dirty:
+        require(not command(['git', 'status', '--porcelain']), 'Worktree must be clean')
     command(['git', 'diff', '--check'])
-    for tag, revision in TAGS.items():
-        require(command(['git', 'rev-parse', tag + '^{commit}']) == revision, f'Tag mismatch: {tag}')
-    command(['git', 'merge-base', '--is-ancestor', '64d9ea61278fbb0b1795d3cfcaaa688dbba9a91d', 'HEAD'])
-    changed = command(['git', 'diff', '--name-only', '64d9ea61278fbb0b1795d3cfcaaa688dbba9a91d', 'HEAD']).splitlines()
-    require(all(p == 'tools/sched_ext/BENCHMARK_PROTOCOL.md' or p.startswith('tools/sched_ext/bench/') for p in changed), 'Implementation changed after protocol freeze')
+    for tag, revision in REQUIRED_TAGS.items():
+        require(command(['git', 'rev-parse', 'refs/tags/' + tag + '^{commit}']) == revision, f'Tag mismatch: {tag}')
+    command(['git', 'merge-base', '--is-ancestor', ACCEPTED_BASE, 'HEAD'])
+    changed = command(['git', 'diff', '--name-only', ACCEPTED_BASE]).splitlines()
+    changed += command(['git', 'log', '--format=', '--name-only', ACCEPTED_BASE + '..HEAD']).splitlines()
+    changed = [p for p in changed if p]
+    changed += command(['git', 'ls-files', '--others', '--exclude-standard']).splitlines()
+    require(set(changed) <= PORTABLE_FILES, 'Files outside the explicit portability scope changed: ' + repr(sorted(set(changed) - PORTABLE_FILES)))
+    runtime = ['src', 'ggml', 'common', 'include', 'tools/server', 'CMakeLists.txt']
+    require(not command(['git', 'diff', '--name-only', TAGS['llama-side-lightweight-v1'], '--'] + runtime), 'Frozen llama implementation changed')
+    scheduler = ['tools/sched_ext/llama_scx.bpf.c', 'tools/sched_ext/llama_scx.c', 'tools/sched_ext/llama_scx_child.c',
+                 'tools/sched_ext/include', 'tools/sched_ext/Makefile', 'tools/sched_ext/provenance']
+    require(not command(['git', 'diff', '--name-only', TAGS['neutral-sched-ext-base-v1'], '--'] + scheduler), 'Frozen scheduler implementation changed')
     return command(['git', 'rev-parse', 'HEAD'])
 
 
 def scheduler_check():
-    for relative, digest in SCHED_HASHES.items():
-        require(sha(SCHED / relative) == digest, f'Scheduler artifact mismatch: {relative}')
+    import host_profile
+    require(HOST and host_profile.artifact_identity() == HOST['scheduler'], 'Scheduler artifacts or embedded BPF path changed')
+    require(HOST['scheduler']['hashes'] == SCHED_HASHES, 'Scheduler profile identity changed')
 
 
 def bundle_env(bundle):
@@ -218,7 +254,7 @@ def bundle_env(bundle):
     keys = {'LD_PRELOAD', 'LD_LIBRARY_PATH', 'CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'PYTHONPATH', 'CC', 'CXX',
             'CPATH', 'CPLUS_INCLUDE_PATH', 'C_INCLUDE_PATH', 'LIBRARY_PATH', 'PKG_CONFIG_PATH', 'GCC_EXEC_PREFIX'}
     env = {k: v for k, v in os.environ.items() if not k.startswith(prefixes) and k not in keys}
-    env.update(PATH='/usr/bin:/bin', OMP_NUM_THREADS='5', OMP_DYNAMIC='FALSE', LD_LIBRARY_PATH=str(bundle / 'bin'))
+    env.update(PATH='/usr/bin:/bin', OMP_NUM_THREADS=str(THREADS['compute']), OMP_DYNAMIC='FALSE', LD_LIBRARY_PATH=str(bundle / 'bin'))
     return env
 
 
@@ -262,7 +298,7 @@ def helper_request(run, op, **args):
 def reduced_bpf():
     result = {}
     for kind in ('prog', 'link', 'map'):
-        objects = json.loads(command(['/usr/sbin/bpftool', '-j', kind, 'show']))
+        objects = json.loads(command([shutil.which('bpftool') or '/usr/sbin/bpftool', '-j', kind, 'show']))
         result[kind] = [{k: obj[k] for k in ('id', 'name', 'type', 'prog_id', 'map_id', 'map_ids') if k in obj} for obj in objects]
     result.update(sched_ext=state(), enable_seq=int(Path('/sys/kernel/sched_ext/enable_seq').read_text()))
     return result

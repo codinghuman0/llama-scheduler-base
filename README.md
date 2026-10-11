@@ -16,6 +16,33 @@
 
 </div>
 
+## Portable Lightweight Base quick start
+
+Supported hosts are Linux x86_64 with working sched_ext, kernel BTF, BPF syscall/configuration, matching kernel sched_ext UAPI headers, and a supported clang/libbpf toolchain. Ubuntu is the automated dependency installation path. Missing kernel facilities produce BLOCKED; there is no fallback scheduler.
+
+```sh
+git clone --branch lightweight-base https://github.com/codinghuman0/llama-scheduler-base.git
+cd llama-scheduler-base
+# Place the team's model.gguf next to this repository (../model.gguf).
+./tools/sched_ext/bench/clean_room_setup.sh
+# Explicit alternative: MODEL=/path/to/model.gguf ./tools/sched_ext/bench/clean_room_setup.sh
+```
+
+The model must be exactly 1117321312 bytes with SHA256 `f3bdf9cf31dee4b57ae4e455a1cb0d01b5c2c1b50d72d3112141c195506c2840`. Setup installs dependencies, checks the host, detects topology, builds the unchanged Base and neutral scheduler, runs correctness smoke, and generates ignored `benchmark-results/host-profile.json`. Expect `CLEAN_ROOM_SETUP_RESULT=PASS`. No performance campaign runs during setup. Optional frequency, temperature and power interfaces are recorded when exposed; setup never changes power settings.
+
+For the frozen A/B/C/D benchmark, close Firefox, all Codex sessions and unnecessary applications, then run these sequentially as the repository's normal user from one terminal:
+
+```sh
+./tools/sched_ext/bench/step10_phase_a_prepare.sh
+./tools/sched_ext/bench/step10_phase_b_arm.sh
+./tools/sched_ext/bench/step10_phase_c_campaign.sh
+./tools/sched_ext/bench/step10_phase_d_finalize.sh
+```
+
+Keep applications closed through Phase D. Results and raw evidence live in `benchmark-results/step10/<UTC-run-id>/`; `.active-run` identifies the current directory. Every run retains its frozen host profile and hash. See [benchmark instructions](tools/sched_ext/bench/README.md) for dry-runs, readiness and profile refresh. At least two usable physical cores are required for an isolated performance campaign; correctness setup/smoke is separate.
+
+For Season 2, create one policy branch per hypothesis from the reviewed portable Base commit, retain its immutable tags, and follow the [Season 2 experiment protocol](tools/sched_ext/SEASON2_EXPERIMENT_PROTOCOL.md). Share the generated result directory for review.
+
 ## 이 저장소에 대하여
 
 이 저장소는 CPU-only LLM inference 환경에서 Linux `sched_ext` 기반 스케줄링을 연구하기 위해 수정한 `llama.cpp` fork입니다.
